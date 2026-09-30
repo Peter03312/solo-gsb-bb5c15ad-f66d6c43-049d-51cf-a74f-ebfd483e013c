@@ -54,8 +54,8 @@
     <!-- 进行中 / 已结束（冻结区） -->
     <section class="card">
       <div class="card-head">
-        <h2>进行中 / 已结束时段</h2>
-        <div class="hint">时段开始后原排期冻结并保留预占；结束时可补记单一照度，或按多段实际照度结算；已结束时段可按原实际起止提交带理由的完整分段更正（新总量替换旧总量）</div>
+        <h2>进行中 / 已暂停 / 已结束时段</h2>
+        <div class="hint">临时闭馆可<strong>暂停</strong>：提交本段起止与完整衔接的照度分段，已展区间计入曝光、暂停空档不曝光并释放预占；<strong>恢复</strong>时提交恢复时间与新预计结束时间，按新预计时长重新预占；允许多次暂停，最终结束按各展出区间累计结算</div>
       </div>
       <div class="table-wrap">
         <table class="data-table" id="frozenTable">
@@ -137,6 +137,57 @@
     </div>
   </div>
 
+  <!-- 暂停弹窗（临时闭馆） -->
+  <div class="modal-mask hidden" id="pauseModal">
+    <div class="modal modal-wide">
+      <h3 id="pa_title">暂停展出 · 闭合本段展出区间</h3>
+      <div class="form-row">
+        <label>本段开始时间</label>
+        <input type="datetime-local" id="pa_start" />
+      </div>
+      <div class="form-row">
+        <label>本段结束时间（暂停时间）</label>
+        <input type="datetime-local" id="pa_end" />
+      </div>
+      <div class="seg-head">
+        <label>本段照度分段（首尾衔接、完整覆盖本段区间；暂停空档不计曝光）</label>
+        <button type="button" class="btn btn-sm" id="pa_addSeg">＋ 添加分段</button>
+      </div>
+      <div id="pa_segments"></div>
+      <div class="form-row computed">本段曝光：<strong id="pa_preview">–</strong> lux·min</div>
+      <div class="form-error hidden" id="pa_error"></div>
+      <div class="modal-actions">
+        <button class="btn" data-close>取消</button>
+        <button class="btn btn-primary" id="pa_save">确认暂停</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 恢复弹窗 -->
+  <div class="modal-mask hidden" id="resumeModal">
+    <div class="modal">
+      <h3 id="rs_title">恢复展出</h3>
+      <div class="form-row cr-span">
+        <label>当前状态</label>
+        <span id="rs_info" class="mono-span"></span>
+      </div>
+      <div class="form-row">
+        <label>恢复时间</label>
+        <input type="datetime-local" id="rs_time" />
+      </div>
+      <div class="form-row">
+        <label>新预计结束时间</label>
+        <input type="datetime-local" id="rs_end" />
+      </div>
+      <div class="form-row computed">恢复后预占：<strong id="rs_preview">–</strong> lux·min（按冻结计划照度 × 新预计时长）</div>
+      <div class="form-error hidden" id="rs_error"></div>
+      <div class="modal-actions">
+        <button class="btn" data-close>取消</button>
+        <button class="btn btn-primary" id="rs_save">确认恢复</button>
+      </div>
+    </div>
+  </div>
+
   <!-- 结束补记弹窗（单一照度 / 多段照度） -->
   <div class="modal-mask hidden" id="finishModal">
     <div class="modal modal-wide">
@@ -174,6 +225,10 @@
       <div class="form-row cr-span">
         <label>原实际区间（不可改）</label>
         <span id="cr_span" class="mono-span"></span>
+      </div>
+      <div class="form-row hidden" id="cr_intervalRow">
+        <label>更正的展出区间</label>
+        <select id="cr_interval"></select>
       </div>
       <div class="form-row">
         <label>更正理由（必填）</label>

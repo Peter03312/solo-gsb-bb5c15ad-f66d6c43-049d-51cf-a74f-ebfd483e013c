@@ -370,6 +370,193 @@ const getState = async () => (await call('GET', '/api/state')).json;
   ok(leg.actualLux === 60 && leg.actualSegments.length === 1 && leg.actualSegments[0].lux === 60,
      '旧单一照度结算在分段视图中合成单段展示');
 
+  // ---------- 本轮：巡展临时闭馆 暂停 / 恢复 ----------
+  console.log('# 16. 暂停/恢复：区间闭合、空档释放预占、恢复重占、账目与缺口重算、区间更正');
+  st = await getState();
+  r = await call('POST', '/api/schedule', { version: st.version, slots: [
+    { cid: 'pa', hall: '九号厅', start: '2028-03-01T09:00', end: '2028-03-01T17:00', lux: 100, artworkIds: [3] },
+  ]});
+  ok(r.status === 200, '排入暂停/恢复用时段');
+  const paId = r.json.slots.find((s) => s.plannedStart.startsWith('2028-03-01')).id;
+  r = await call('POST', `/api/slots/${paId}/start`);
+  ok(r.status === 200, '暂停用时段已启动');
+  let pv = r.json.version;
+
+  // 16.1 缺/错版本 -> 409 + 最新预算
+  r = await call('POST', `/api/slots/${paId}/pause`, {
+    start: '2028-03-01T09:00', end: '2028-03-01T11:00',
+    segments: [{ start: '2028-03-01T09:00', end: '2028-03-01T11:00', lux: 100 }],
+  });
+  ok(r.status === 409 && r.json.error?.code === 'VERSION_STALE' && r.json.state.version === pv,
+     '暂停缺版本返回 409 与最新预算');
+
+  // 16.2 分段非法整次拒绝（时序/缺口/负值）
+  r = await call('POST', `/api/slots/${paId}/pause`, {
+    version: pv, start: '2028-03-01T09:00', end: '2028-03-01T11:00',
+    segments: [
+      { start: '2028-03-01T09:00', end: '2028-03-01T10:00', lux: 200 },
+      { start: '2028-03-01T10:30', end: '2028-03-01T11:00', lux: -5 },
+    ],
+  });
+  ok(r.status === 422 && r.json.error?.code === 'SEGMENTS_INVALID', '暂停分段缺口/负值整次拒绝');
+  // 暂停终点不晚于本段起点
+  r = await call('POST', `/api/slots/${paId}/pause`, {
+    version: pv, start: '2028-03-01T11:00', end: '2028-03-01T09:00',
+    segments: [{ start: '2028-03-01T11:00', end: '2028-03-01T09:00', lux: 100 }],
+  });
+  ok(r.status === 422, '暂停终点早于起点被拒');
+  st = await getState();
+  ok(st.version === pv && st.slots.find((s) => s.id === paId).status === 'running' &&
+     st.slots.find((s) => s.id === paId).currentReservation === 48000,
+     '暂停被拒后状态/账目/版本不变（仍预占 480 分×100=48000）');
+
+  // 16.3 首次暂停（可录实际开始）：60×200 + 60×100 = 18000
+  r = await call('POST', `/api/slots/${paId}/pause`, {
+    version: pv, start: '2028-03-01T09:00', end: '2028-03-01T11:00',
+    segments: [
+      { start: '2028-03-01T09:00', end: '2028-03-01T10:00', lux: 200 },
+      { start: '2028-03-01T10:00', end: '2028-03-01T11:00', lux: 100 },
+    ],
+  });
+  ok(r.status === 200 && r.json.pausedInterval.exposure === 18000, `首次暂停成功，本段=${r.json.pausedInterval?.exposure}`);
+  const p1 = r.json.slots.find((s) => s.id === paId);
+  ok(p1.status === 'paused' && p1.pauseCount === 1 && p1.currentReservation === 0 &&
+     p1.accumulatedExposure === 18000 && p1.intervals.length === 1,
+     '暂停态：预占释放为 0，累计已展 18000，区间 1 个');
+  pv = r.json.version;
+
+  // 16.4 暂停态不能再暂停/旧 finish；非暂停态不能恢复
+  r = await call('POST', `/api/slots/${paId}/pause`, { version: pv, start: '2028-03-01T11:00', end: '2028-03-01T12:00',
+    segments: [{ start: '2028-03-01T11:00', end: '2028-03-01T12:00', lux: 50 }] });
+  ok(r.status === 422 && r.json.error.code === 'NOT_RUNNING', '暂停态再暂停被拒');
+  r = await call('POST', `/api/slots/${paId}/finish`, { actualStart: '2028-03-01T09:00', actualEnd: '2028-03-01T15:00', actualLux: 1 });
+  ok(r.status === 422 && r.json.error.code === 'NOT_RUNNING', '暂停态旧 finish 被拒');
+
+  // 16.5 非法恢复时序
+  r = await call('POST', `/api/slots/${paId}/resume`, { version: pv, resumeTime: '2028-03-01T11:00', estimatedEnd: '2028-03-01T18:00' });
+  ok(r.status === 422, '恢复时间必须严格晚于上次暂停终点');
+  r = await call('POST', `/api/slots/${paId}/resume`, { version: pv, resumeTime: '2028-03-01T13:00', estimatedEnd: '2028-03-01T12:00' });
+  ok(r.status === 422, '新预计结束必须晚于恢复时间');
+
+  // 16.6 暂停空档（11:00~13:00）允许同作品排期；已展区间不允许
+  r = await call('POST', '/api/schedule', { version: pv, slots: [
+    { cid: 'gapok', hall: '十号厅', start: '2028-03-01T11:30', end: '2028-03-01T12:30', lux: 100, artworkIds: [3] },
+  ]});
+  ok(r.status === 200, '暂停空档可排入同作品其他时段（空档不占用）');
+  pv = r.json.version;
+  r = await call('POST', '/api/schedule', { version: pv, slots: [
+    { cid: 'gapbad', hall: '十号厅', start: '2028-03-01T10:30', end: '2028-03-01T11:30', lux: 100, artworkIds: [3] },
+  ]});
+  ok(r.status === 422 && r.json.conflicts?.[0]?.kind === 'new-frozen', '与已闭合展出区间重叠的排期被拒');
+
+  // 16.7 合法恢复：13:00 -> 17:00 = 240 分 × 100 = 24000 重新预占（空档时段 11:30~12:30 已结束、不冲突）
+  r = await call('POST', `/api/slots/${paId}/resume`, { version: pv, resumeTime: '2028-03-01T13:00', estimatedEnd: '2028-03-01T17:00' });
+  ok(r.status === 200 && r.json.currentReservation === 24000 && r.json.resumedAt === '2028-03-01T13:00',
+     `恢复成功，重新预占 ${r.json.currentReservation}`);
+  const p2 = r.json.slots.find((s) => s.id === paId);
+  ok(p2.status === 'running' && p2.resumeStart === '2028-03-01T13:00' && p2.estimatedEnd === '2028-03-01T17:00' &&
+     p2.accumulatedExposure === 18000, '恢复后 running，已展区间保留 18000');
+  pv = r.json.version;
+
+  // 16.8 恢复后暂停：起点必须等于恢复时间；分段完整
+  r = await call('POST', `/api/slots/${paId}/pause`, { version: pv, start: '2028-03-01T13:30', end: '2028-03-01T15:00',
+    segments: [{ start: '2028-03-01T13:30', end: '2028-03-01T15:00', lux: 100 }] });
+  ok(r.status === 422, '恢复后再暂停，起点≠恢复时间被拒');
+  r = await call('POST', `/api/slots/${paId}/pause`, { version: pv, start: '2028-03-01T13:00', end: '2028-03-01T15:00',
+    segments: [
+      { start: '2028-03-01T13:00', end: '2028-03-01T14:00', lux: 100 },
+      { start: '2028-03-01T14:00', end: '2028-03-01T15:00', lux: 50 },
+    ] });
+  ok(r.status === 200 && r.json.pausedInterval.exposure === 9000, `第二次暂停 60×100+60×50=${r.json.pausedInterval?.exposure}`);
+  const p3 = r.json.slots.find((s) => s.id === paId);
+  ok(p3.pauseCount === 2 && p3.accumulatedExposure === 27000 && p3.currentReservation === 0 &&
+     p3.intervals[1].start === '2028-03-01T13:00',
+     '区间按时间递增、互不重叠；累计 27000，预占再次释放');
+  pv = r.json.version;
+
+  // 16.9 在第二个暂停空档（15:00 之后）排同作品时段，再恢复时预占与之重叠 -> INTERVAL_OVERLAP 整次拒绝
+  r = await call('POST', '/api/schedule', { version: pv, slots: [
+    { cid: 'gap2', hall: '十二号厅', start: '2028-03-01T15:30', end: '2028-03-01T16:30', lux: 100, artworkIds: [3] },
+  ]});
+  ok(r.status === 200, '第二个暂停空档排入同作品时段');
+  pv = r.json.version;
+  r = await call('POST', `/api/slots/${paId}/resume`, { version: pv, resumeTime: '2028-03-01T15:00', estimatedEnd: '2028-03-01T15:00' });
+  ok(r.status === 422, '新预计结束不晚于恢复时间被拒');
+  r = await call('POST', `/api/slots/${paId}/resume`, { version: pv, resumeTime: '2028-03-01T15:20', estimatedEnd: '2028-03-01T17:00' });
+  ok(r.status === 422 && r.json.error?.code === 'INTERVAL_OVERLAP' && r.json.conflicts?.length >= 1,
+     '恢复预占与空档时段重叠整次拒绝');
+  st = await getState();
+  ok(st.version === pv && st.slots.find((s) => s.id === paId).status === 'paused', '恢复被拒：状态/版本不变');
+
+  // 16.10 暂停中按已展区间直接收尾（不恢复）
+  r = await call('POST', `/api/slots/${paId}/settle`, { version: pv });
+  ok(r.status === 200 && r.json.justFinishedExposure === 27000 && r.json.justIntervals.length === 2,
+     `暂停中直接收尾：累计 ${r.json.justFinishedExposure}，区间数 ${r.json.justIntervals?.length}`);
+  const pf = r.json.slots.find((s) => s.id === paId);
+  ok(pf.status === 'finished' && pf.pauseCount === 2 && pf.actualStart === '2028-03-01T09:00' &&
+     pf.actualEnd === '2028-03-01T15:00' && pf.actualExposure === 27000 && pf.currentReservation === null,
+     '收尾后 finished：首段起点/末段终点，总量=区间累计，暂停 2 次');
+  pv = r.json.version;
+
+  // 16.11 收尾后不能再 pause/resume；settle 拒绝
+  r = await call('POST', `/api/slots/${paId}/pause`, { version: pv, start: '2028-03-01T15:00', end: '2028-03-01T16:00',
+    segments: [{ start: '2028-03-01T15:00', end: '2028-03-01T16:00', lux: 1 }] });
+  ok(r.status === 422 && r.json.error.code === 'NOT_RUNNING', '已结束不能暂停');
+  r = await call('POST', `/api/slots/${paId}/resume`, { version: pv, resumeTime: '2028-03-01T15:00', estimatedEnd: '2028-03-01T16:00' });
+  ok(r.status === 422 && r.json.error.code === 'NOT_PAUSED', '已结束不能恢复');
+
+  // 16.12 按区间更正（必须带 intervalIndex，覆盖该区间原起止）
+  r = await call('POST', `/api/slots/${paId}/correct`, { version: pv, reason: '区间1复核',
+    segments: [{ start: '2028-03-01T09:00', end: '2028-03-01T11:00', lux: 50 }] });
+  ok(r.status === 422, '暂停流时段更正必须指定 intervalIndex');
+  r = await call('POST', `/api/slots/${paId}/correct`, { version: pv, reason: '区间1复核', intervalIndex: 9,
+    segments: [{ start: '2028-03-01T09:00', end: '2028-03-01T11:00', lux: 50 }] });
+  ok(r.status === 422, 'intervalIndex 越界被拒');
+  r = await call('POST', `/api/slots/${paId}/correct`, { version: pv, reason: '区间1复核', intervalIndex: 1,
+    segments: [{ start: '2028-03-01T09:00', end: '2028-03-01T10:00', lux: 50 }] });
+  ok(r.status === 422 && r.json.error.code === 'SEGMENTS_INVALID', '区间更正分段未覆盖该区间被整批拒绝');
+  // 18000 -> 6000；总量 27000 -> 15000
+  r = await call('POST', `/api/slots/${paId}/correct`, { version: pv, reason: '区间1复核降为50lux', intervalIndex: 1,
+    segments: [{ start: '2028-03-01T09:00', end: '2028-03-01T11:00', lux: 50 }] });
+  ok(r.status === 200 && r.json.beforeExposure === 18000 && r.json.afterExposure === 6000 &&
+     r.json.correction.intervalIndex === 1,
+     `区间1 更正 ${r.json.beforeExposure} -> ${r.json.afterExposure}，留痕标注区间号`);
+  const pc = r.json.slots.find((s) => s.id === paId);
+  ok(pc.actualExposure === 15000 && pc.intervals[0].exposure === 6000 && pc.intervals[1].exposure === 9000,
+     '更正后：区间1=6000、区间2=9000、总量15000（替换不累计）');
+
+  // 16.13 暂停流 running 收尾的另一条路径：恢复后提交最后区间结算
+  st = await getState();
+  r = await call('POST', '/api/schedule', { version: st.version, slots: [
+    { cid: 'pb', hall: '十一号厅', start: '2028-05-01T09:00', end: '2028-05-01T12:00', lux: 100, artworkIds: [3] },
+  ]});
+  ok(r.status === 200, `排入 B 路径时段（${r.status}）`);
+  const pbId = r.json.slots.find((s) => s.plannedStart.startsWith('2028-05-01')).id;
+  r = await call('POST', `/api/slots/${pbId}/start`);
+  pv = r.json.version;
+  r = await call('POST', `/api/slots/${pbId}/pause`, { version: pv, start: '2028-05-01T09:00', end: '2028-05-01T10:00',
+    segments: [{ start: '2028-05-01T09:00', end: '2028-05-01T10:00', lux: 100 }] });
+  ok(r.status === 200, 'B 时段暂停 6000');
+  pv = r.json.version;
+  r = await call('POST', `/api/slots/${pbId}/resume`, { version: pv, resumeTime: '2028-05-01T11:00', estimatedEnd: '2028-05-01T12:00' });
+  ok(r.status === 200, 'B 时段恢复 11:00~12:00 预占 6000');
+  pv = r.json.version;
+  // 最后区间起点必须等于恢复时间
+  r = await call('POST', `/api/slots/${pbId}/settle`, { version: pv, start: '2028-05-01T11:30', end: '2028-05-01T12:00',
+    segments: [{ start: '2028-05-01T11:30', end: '2028-05-01T12:00', lux: 100 }] });
+  ok(r.status === 422, '最后区间起点≠恢复时间被拒');
+  // 暂停流 running 上旧 finish 被拒（避免账实不符）
+  r = await call('POST', `/api/slots/${pbId}/finish`, { actualStart: '2028-05-01T11:00', actualEnd: '2028-05-01T12:00', actualLux: 100 });
+  ok(r.status === 422 && r.json.error.code === 'NOT_RUNNING', '已有展出区间的时段拒绝旧单一照度 finish');
+  // 合法最后区间：11:00~12:00 = 6000；总 12000
+  r = await call('POST', `/api/slots/${pbId}/settle`, { version: pv, start: '2028-05-01T11:00', end: '2028-05-01T12:00',
+    segments: [{ start: '2028-05-01T11:00', end: '2028-05-01T12:00', lux: 100 }] });
+  ok(r.status === 200 && r.json.justFinishedExposure === 12000 && r.json.justIntervals.length === 2,
+     `恢复后提交最后区间结算成功，总=${r.json.justFinishedExposure}`);
+  const pbf = r.json.slots.find((s) => s.id === pbId);
+  ok(pbf.status === 'finished' && pbf.pauseCount === 1 && pbf.actualStart === '2028-05-01T09:00' &&
+     pbf.actualEnd === '2028-05-01T12:00', 'B 收尾：1 次暂停，跨空档的起止与区间累计一致');
+
   console.log(`\n结果：${pass} 通过，${fail} 失败`);
   process.exit(fail ? 1 : 0);
 })().catch((e) => { console.error(e); process.exit(1); });

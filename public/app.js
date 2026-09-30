@@ -22,7 +22,11 @@ function minutes(s, e) {
   return Math.round((me - ms) / 60000);
 }
 function statusBadge(s) {
-  if (s.status === 'running') return '<span class="badge badge-running">进行中·冻结</span>';
+  if (s.status === 'paused') return '<span class="badge badge-paused">已暂停</span>';
+  if (s.status === 'running') {
+    if (s.pauseCount > 0) return `<span class="badge badge-running">进行中·已暂停${s.pauseCount}次</span>`;
+    return '<span class="badge badge-running">进行中·冻结</span>';
+  }
   if (s.status === 'finished') return '<span class="badge badge-finished">已结束</span>';
   if (s.blocked) return '<span class="badge badge-blocked">不可启动</span>';
   return '<span class="badge badge-scheduled">未开始</span>';
@@ -118,44 +122,103 @@ function segmentExpoHtml(total, segs) {
   return `<div class="seg-total">${fmt(total)}${detail}</div>`;
 }
 
+// 暂停/恢复流：已闭合展出区间明细（区间之间的空档不计曝光）
+function intervalsHtml(s) {
+  const list = s.intervals || [];
+  if (!list.length) return null;
+  const rows = list.map((it, i) => `
+    <div class="int-block">
+      <div class="int-head mono-span">区间 ${i + 1}：${esc(it.start.slice(11))}～${esc(it.end.slice(11))}
+        <span class="int-mins">${fmt(it.minutes)} 分</span></div>
+      ${it.segments.map((g) => `<div class="seg-line mono-span">${esc(g.start.slice(11))}～${esc(g.end.slice(11))} · ${fmt(g.lux)} lux</div>`).join('')}
+    </div>`).join('');
+  const open = s.status === 'running' && s.resumeStart
+    ? `<div class="int-open mono-span">展出中：${esc(s.resumeStart.slice(11))}～${esc(s.estimatedEnd ? s.estimatedEnd.slice(11) : '?')}
+         <span class="int-mins">（恢复后预占 ${fmt(s.currentReservation)}）</span></div>`
+    : s.status === 'paused'
+      ? '<div class="int-open paused-gap mono-span">⏸ 暂停中：空档不曝光，预占已释放</div>'
+      : '';
+  return rows + open;
+}
+
 function renderFrozen() {
   const tb = $('#frozenTable tbody');
   const rows = state.slots
-    .filter((s) => s.status === 'running' || s.status === 'finished')
+    .filter((s) => s.status === 'running' || s.status === 'paused' || s.status === 'finished')
     .sort((a, b) => a.seq - b.seq);
   if (!rows.length) {
-    tb.innerHTML = '<tr class="empty-row"><td colspan="11">暂无进行中或已结束时段</td></tr>';
+    tb.innerHTML = '<tr class="empty-row"><td colspan="11">暂无进行中、已暂停或已结束时段</td></tr>';
     return;
   }
-  tb.innerHTML = rows.map((s) => `
+  tb.innerHTML = rows.map((s) => {
+    const iv = intervalsHtml(s);
+    const isFlow = !!iv;
+    // 实际起止/分段列：暂停流显示展出区间；否则显示旧的实际/冻结视图
+    const coverCell = isFlow
+      ? iv
+      : (s.actualStart
+        ? `<div class="seg-cover mono-span">${esc(s.actualStart)}<br>～ ${esc(s.actualEnd)}</div>${
+            s.actualSegments.length > 1
+              ? s.actualSegments.map((g) => `<div class="seg-line mono-span">${esc(g.start.slice(11))}～${esc(g.end.slice(11))}</div>`).join('')
+              : ''}`
+        : '—（冻结中）');
+    const luxCell = isFlow
+      ? (s.intervals.flatMap((it) => it.segments).length
+          ? segmentLuxHtml(s.intervals.flatMap((it) => it.segments))
+          : '—')
+      : (s.actualStart === null ? '—' : segmentLuxHtml(s.actualSegments));
+    const expoCell = isFlow
+      ? `<div class="seg-total">${fmt(s.accumulatedExposure)}</div>
+         <div class="acc-sub">累计已展${s.status === 'finished' ? '' : '（计入已用）'}</div>
+         ${(s.status === 'running' || s.status === 'paused')
+            ? `<div class="acc-sub ${s.currentReservation === 0 ? 'muted-acc' : ''}">当前预占 ${fmt(s.currentReservation)}</div>`
+            : ''}`
+      : (s.actualExposure === null ? '—' : segmentExpoHtml(s.actualExposure, s.actualSegments));
+    const actions = actionButtons(s);
+    return `
     <tr>
       <td>${s.seq}</td>
       <td>${esc(s.hall)}</td>
       <td>${statusBadge(s)}</td>
       <td class="mono" style="font-family:var(--mono);font-size:12.5px;white-space:nowrap">
         ${esc(s.plannedStart)}<br>～ ${esc(s.plannedEnd)}
+        ${s.resumeStart ? `<div class="resume-tag mono-span">恢复 ${esc(s.resumeStart)}<br>～ ${esc(s.estimatedEnd)}</div>` : ''}
       </td>
       <td class="num">${fmt(s.plannedLux)}</td>
       <td class="num">${fmt(s.plannedExposure)}</td>
-      <td>
-        ${s.actualStart
-          ? `<div class="seg-cover mono-span">${esc(s.actualStart)}<br>～ ${esc(s.actualEnd)}</div>${
-              s.actualSegments.length > 1
-                ? s.actualSegments.map((g) => `<div class="seg-line mono-span">${esc(g.start.slice(11))}～${esc(g.end.slice(11))}</div>`).join('')
-                : ''}`
-          : '—（冻结中）'}
-      </td>
-      <td class="num">${s.actualStart === null ? '—' : segmentLuxHtml(s.actualSegments)}</td>
-      <td class="num">${s.actualExposure === null ? '—' : segmentExpoHtml(s.actualExposure, s.actualSegments)}</td>
+      <td>${coverCell}</td>
+      <td class="num">${luxCell}</td>
+      <td class="num">${expoCell}</td>
       <td><div class="art-chips">${s.artworks.map((a) => `<span class="chip">${esc(a.name)}</span>`).join('')}</div></td>
-      <td>
-        ${s.status === 'running'
-          ? `<button class="btn btn-sm btn-primary" data-act="finish" data-id="${s.id}">结束补记</button>`
-          : `<div class="row-actions"><span style="color:var(--muted)">已结算</span>
-             <button class="btn btn-sm" data-act="correct" data-id="${s.id}">分段更正</button></div>`}
-      </td>
-    </tr>
-  `).join('');
+      <td>${actions}</td>
+    </tr>`;
+  }).join('');
+}
+
+function actionButtons(s) {
+  if (s.status === 'paused') {
+    return `<div class="row-actions">
+        <button class="btn btn-sm btn-primary" data-act="resume" data-id="${s.id}">▶ 恢复</button>
+        <button class="btn btn-sm" data-act="settle-close" data-id="${s.id}">结束（按已展区间）</button>
+        <button class="btn btn-sm" data-act="correct" data-id="${s.id}">分段更正</button>
+      </div>`;
+  }
+  if (s.status === 'running') {
+    if ((s.intervals || []).length) {
+      // 暂停恢复流：暂停 / 最后区间结算 / 区间更正
+      return `<div class="row-actions">
+        <button class="btn btn-sm btn-warn" data-act="pause" data-id="${s.id}">⏸ 暂停</button>
+        <button class="btn btn-sm btn-primary" data-act="settle-interval" data-id="${s.id}">结束并结算</button>
+        <button class="btn btn-sm" data-act="correct" data-id="${s.id}">分段更正</button>
+      </div>`;
+    }
+    return `<div class="row-actions">
+      <button class="btn btn-sm btn-warn" data-act="pause" data-id="${s.id}">⏸ 暂停</button>
+      <button class="btn btn-sm btn-primary" data-act="finish" data-id="${s.id}">结束补记</button>
+    </div>`;
+  }
+  return `<div class="row-actions"><span style="color:var(--muted)">已结算</span>
+    <button class="btn btn-sm" data-act="correct" data-id="${s.id}">分段更正</button></div>`;
 }
 
 // ---------- 渲染：分段更正记录 ----------
@@ -178,7 +241,7 @@ function renderCorrections() {
     return `
       <tr>
         <td class="mono-span" style="white-space:nowrap">${esc(formatTs(c.createdAt))}</td>
-        <td>#${slot.seq} ${esc(slot.hall)}</td>
+        <td>#${slot.seq} ${esc(slot.hall)}${c.intervalIndex != null ? `<br><span class="int-tag">区间 ${c.intervalIndex}</span>` : ''}</td>
         <td style="max-width:240px">${esc(c.reason)}</td>
         <td class="mono-span" style="white-space:nowrap">${esc(c.before.start)}<br>～ ${esc(c.before.end)}</td>
         <td class="num">${fmt(c.before.exposure)}</td>
@@ -409,11 +472,17 @@ $('#frozenTable').addEventListener('click', (e) => {
   const slot = state.slots.find((s) => s.id === id);
   if (btn.dataset.act === 'finish') openFinishModal(slot);
   if (btn.dataset.act === 'correct') openCorrectModal(slot);
+  if (btn.dataset.act === 'pause') openPauseModal(slot);
+  if (btn.dataset.act === 'resume') openResumeModal(slot);
+  if (btn.dataset.act === 'settle-interval') openSettleIntervalModal(slot);
+  if (btn.dataset.act === 'settle-close') settleClose(slot);
 });
 
 function openFinishModal(slot) {
   finishingSlotId = slot.id;
+  fnIsInterval = false;
   $('#fn_multi').checked = false;
+  $('#fn_multi').disabled = false;
   $('#fn_singleBox').classList.remove('hidden');
   $('#fn_multiBox').classList.add('hidden');
   $('#fn_start').value = slot.actualStart || slot.plannedStart;
@@ -499,8 +568,20 @@ $('#fn_save').addEventListener('click', async () => {
   const multi = $('#fn_multi').checked;
   const actualStart = $('#fn_start').value;
   const actualEnd = $('#fn_end').value;
-  let payload;
-  if (multi) {
+  let payload, path;
+  if (fnIsInterval) {
+    // 暂停恢复流：提交恢复时间起的最后区间（字段为 start/end）
+    path = 'settle';
+    payload = {
+      version: state.version,
+      start: actualStart,
+      end: actualEnd,
+      segments: collectSegmentRows($('#fn_segments')).map((r) => ({
+        start: r.start, end: r.end, lux: r.lux === '' ? null : Number(r.lux),
+      })),
+    };
+  } else if (multi) {
+    path = 'settle';
     payload = {
       version: state.version,
       actualStart,
@@ -510,17 +591,18 @@ $('#fn_save').addEventListener('click', async () => {
       })),
     };
   } else {
+    path = 'finish';
     payload = { actualStart, actualEnd, actualLux: Number($('#fn_lux').value) };
   }
   try {
-    const next = await api(`/api/slots/${finishingSlotId}/${multi ? 'settle' : 'finish'}`, {
+    const next = await api(`/api/slots/${fnIsInterval ? settlingSlotId : finishingSlotId}/${path}`, {
       method: 'POST',
       body: payload,
     });
     $('#finishModal').classList.add('hidden');
     applyNewState(next);
     if (next.blockedAfterFinish && next.blockedAfterFinish.length) {
-      toast('warn', `已结算，实际曝光 ${fmt(next.justFinishedExposure)} lux·min 已替换预占。\n超量导致以下后续时段预算不足、不可开始：\n${blockedToastDetail(next.blockedAfterFinish)}\n请调整排期或更正分段后重新核算`);
+      toast('warn', `已结算，累计实际曝光 ${fmt(next.justFinishedExposure)} lux·min 已替换预占。\n超量导致以下后续时段预算不足、不可开始：\n${blockedToastDetail(next.blockedAfterFinish)}\n请调整排期或更正分段后重新核算`);
     } else {
       toast('success', `已结束并结算，实际曝光 ${fmt(next.justFinishedExposure)} lux·min 已替换预占`);
     }
@@ -535,23 +617,198 @@ $('#fn_save').addEventListener('click', async () => {
   }
 });
 
+// ---------- 暂停 / 恢复 ----------
+let pausingSlotId = null;
+let paSegments = [];
+
+function openPauseModal(slot) {
+  pausingSlotId = slot.id;
+  const resumed = slot.resumeStart || null;
+  // 本段起点：恢复后必须从恢复时间开始；首次可录实际开始（默认计划开始）
+  const startDefault = resumed || slot.plannedStart;
+  const endDefault = resumed ? slot.estimatedEnd : slot.plannedEnd;
+  $('#pa_title').textContent = resumed
+    ? `#${slot.seq} ${slot.hall} · 再次暂停（本段自恢复时间开始）`
+    : `#${slot.seq} ${slot.hall} · 暂停展出（临时闭馆）`;
+  $('#pa_start').value = startDefault;
+  $('#pa_end').value = endDefault;
+  paSegments = [{ start: startDefault, end: endDefault, lux: slot.plannedLux }];
+  renderPaSegments();
+  $('#pa_error').classList.add('hidden');
+  updatePaPreview();
+  $('#pauseModal').classList.remove('hidden');
+}
+function renderPaSegments() { $('#pa_segments').innerHTML = segmentEditorRowsHtml(paSegments, 'pa'); }
+function updatePaPreview() {
+  const v = segmentsExposure(collectSegmentRows($('#pa_segments')));
+  $('#pa_preview').textContent = v === null ? '–' : fmt(v);
+}
+$('#pa_addSeg').addEventListener('click', () => {
+  paSegments = collectSegmentRows($('#pa_segments'));
+  const prev = paSegments[paSegments.length - 1] || {};
+  paSegments.push({ start: prev.end || '', end: $('#pa_end').value || '', lux: '' });
+  renderPaSegments();
+  updatePaPreview();
+});
+$('#pa_segments').addEventListener('click', (e) => {
+  if (!e.target.closest('button[data-act="rm"]')) return;
+  paSegments = collectSegmentRows($('#pa_segments'));
+  paSegments.splice(Number(e.target.closest('.seg-row').dataset.i), 1);
+  renderPaSegments();
+  updatePaPreview();
+});
+$('#pa_segments').addEventListener('input', updatePaPreview);
+$('#pa_start').addEventListener('change', () => {
+  const rows = collectSegmentRows($('#pa_segments'));
+  if (rows[0]) { rows[0].start = $('#pa_start').value; paSegments = rows; renderPaSegments(); updatePaPreview(); }
+});
+$('#pa_end').addEventListener('change', () => {
+  const rows = collectSegmentRows($('#pa_segments'));
+  if (rows.length) { rows[rows.length - 1].end = $('#pa_end').value; paSegments = rows; renderPaSegments(); updatePaPreview(); }
+});
+$('#pa_save').addEventListener('click', async () => {
+  const payload = {
+    version: state.version,
+    start: $('#pa_start').value,
+    end: $('#pa_end').value,
+    segments: collectSegmentRows($('#pa_segments')).map((r) => ({
+      start: r.start, end: r.end, lux: r.lux === '' ? null : Number(r.lux),
+    })),
+  };
+  try {
+    const next = await api(`/api/slots/${pausingSlotId}/pause`, { method: 'POST', body: payload });
+    $('#pauseModal').classList.add('hidden');
+    applyNewState(next);
+    const tail = next.blockedAfterFinish && next.blockedAfterFinish.length
+      ? `\n预占释放后重算，以下后续时段状态变化：\n${blockedToastDetail(next.blockedAfterFinish)}`
+      : '\n后续时段缺口已重算';
+    toast('success', `已暂停：本段曝光 ${fmt(next.pausedInterval.exposure)} 计入已用，暂停空档不曝光、预占已释放；累计 ${fmt(next.accumulatedExposure)}${tail}`);
+  } catch (err) {
+    if (err.status === 409) { $('#pauseModal').classList.add('hidden'); return handleMutationError(err); }
+    $('#pa_error').textContent = formatSegmentError(err);
+    $('#pa_error').classList.remove('hidden');
+  }
+});
+
+let resumingSlotId = null;
+function openResumeModal(slot) {
+  resumingSlotId = slot.id;
+  const last = (slot.intervals || []).at(-1);
+  $('#rs_title').textContent = `#${slot.seq} ${slot.hall} · 恢复展出`;
+  $('#rs_info').innerHTML = `已暂停 ${slot.pauseCount} 次 · 累计已展 ${fmt(slot.accumulatedExposure)} lux·min` +
+    (last ? `<br>上次暂停终点：${esc(last.end)}` : '');
+  $('#rs_time').value = last ? last.end : '';
+  $('#rs_end').value = slot.plannedEnd || '';
+  $('#rs_error').classList.add('hidden');
+  updateResumePreview();
+  $('#resumeModal').classList.remove('hidden');
+}
+function updateResumePreview() {
+  const m = minutes($('#rs_time').value, $('#rs_end').value);
+  const slot = state.slots.find((s) => s.id === resumingSlotId);
+  const lux = slot ? slot.plannedLux : 0;
+  $('#rs_preview').textContent = (m !== null && m > 0) ? fmt(Math.round(m * lux)) : '–';
+}
+['rs_time', 'rs_end'].forEach((id) => $('#' + id).addEventListener('input', updateResumePreview));
+$('#rs_save').addEventListener('click', async () => {
+  const payload = {
+    version: state.version,
+    resumeTime: $('#rs_time').value,
+    estimatedEnd: $('#rs_end').value,
+  };
+  try {
+    const next = await api(`/api/slots/${resumingSlotId}/resume`, { method: 'POST', body: payload });
+    $('#resumeModal').classList.add('hidden');
+    applyNewState(next);
+    toast('success', `已恢复：自 ${next.resumedAt} 起按计划照度重新预占 ${fmt(next.currentReservation)} lux·min（至 ${next.estimatedEnd}）`);
+  } catch (err) {
+    if (err.status === 409) { $('#resumeModal').classList.add('hidden'); return handleMutationError(err); }
+    $('#rs_error').textContent = formatSegmentError(err);
+    $('#rs_error').classList.remove('hidden');
+  }
+});
+
+// 暂停流最终结算：恢复后提交最后一个区间
+let settlingSlotId = null;
+let fnIsInterval = false;
+function openSettleIntervalModal(slot) {
+  settlingSlotId = slot.id;
+  fnIsInterval = true;
+  $('#fn_multi').checked = true;
+  $('#fn_multi').disabled = true;
+  $('#fn_singleBox').classList.add('hidden');
+  $('#fn_multiBox').classList.remove('hidden');
+  // 最后区间：起点=恢复时间，默认终点=新预计结束
+  const st0 = slot.resumeStart || '';
+  const en0 = slot.estimatedEnd || slot.plannedEnd || '';
+  $('#fn_start').value = st0;
+  $('#fn_end').value = en0;
+  $('#fn_lux').value = slot.plannedLux;
+  fnSegments = [{ start: st0, end: en0, lux: slot.plannedLux }];
+  renderFnSegments();
+  $('#fn_error').classList.add('hidden');
+  updateFinishPreview();
+  $('#finishModal').classList.remove('hidden');
+}
+// 暂停中直接按已展出区间收尾
+async function settleClose(slot) {
+  if (!confirm(`按已提交的 ${slot.intervals.length} 个展出区间（累计 ${fmt(slot.accumulatedExposure)} lux·min）结束该时段？`)) return;
+  try {
+    const next = await api(`/api/slots/${slot.id}/settle`, { method: 'POST', body: { version: state.version } });
+    applyNewState(next);
+    toast('success', `已结束：${next.justIntervals.length} 个展出区间累计 ${fmt(next.justFinishedExposure)} lux·min（暂停空档不计）`);
+  } catch (err) { await handleMutationError(err); }
+}
+
 // ---------- 已结束时段：分段更正 ----------
 let correctingSlotId = null;
 let crSegments = [];
+let crIntervalIndex = null;   // 暂停/恢复流：当前选择的区间编号；老链路为 null
+let crIntervals = [];
 
 function openCorrectModal(slot) {
   correctingSlotId = slot.id;
+  crIntervals = slot.intervals || [];
   $('#cr_title').textContent = `#${slot.seq} ${slot.hall} · 分段更正`;
-  $('#cr_span').textContent = `${slot.actualStart} ～ ${slot.actualEnd}（原实际曝光 ${slot.actualExposure} lux·min）`;
+
+  const sel = $('#cr_interval');
+  const row = $('#cr_intervalRow');
+  if (crIntervals.length) {
+    row.classList.remove('hidden');
+    sel.innerHTML = crIntervals.map((it, i) =>
+      `<option value="${i + 1}">区间 ${i + 1}：${it.start.slice(11)}～${it.end.slice(11)}（${fmt(it.exposure)} lux·min）</option>`
+    ).join('');
+    sel.value = '1';
+    sel.onchange = () => loadCrInterval(Number(sel.value));
+    $('#cr_span').textContent = '该时段含多次暂停/恢复，请在右侧选择要更正的已闭合展出区间（区间起止不可改）';
+    loadCrInterval(1);
+  } else {
+    row.classList.add('hidden');
+    crIntervalIndex = null;
+    $('#cr_span').textContent = `${slot.actualStart} ～ ${slot.actualEnd}（原实际曝光 ${slot.actualExposure} lux·min）`;
+    crSegments = (slot.actualSegments && slot.actualSegments.length
+      ? slot.actualSegments
+      : [{ start: slot.actualStart, end: slot.actualEnd, lux: slot.actualLux }]
+    ).map((g) => ({ start: g.start, end: g.end, lux: g.lux }));
+    renderCrSegments();
+    updateCorrectPreview();
+  }
   $('#cr_reason').value = '';
-  crSegments = (slot.actualSegments && slot.actualSegments.length
-    ? slot.actualSegments
-    : [{ start: slot.actualStart, end: slot.actualEnd, lux: slot.actualLux }]
+  $('#cr_error').classList.add('hidden');
+  $('#correctModal').classList.remove('hidden');
+}
+
+// 载入某个已闭合区间的分段到编辑器
+function loadCrInterval(index) {
+  crIntervalIndex = index;
+  const it = crIntervals[index - 1];
+  $('#cr_span').textContent = `区间 ${index}（起止不可改）：${it.start} ～ ${it.end}，原曝光 ${fmt(it.exposure)} lux·min`;
+  crSegments = (it.segments && it.segments.length
+    ? it.segments
+    : [{ start: it.start, end: it.end, lux: null }]
   ).map((g) => ({ start: g.start, end: g.end, lux: g.lux }));
   renderCrSegments();
-  $('#cr_error').classList.add('hidden');
   updateCorrectPreview();
-  $('#correctModal').classList.remove('hidden');
 }
 function renderCrSegments() {
   $('#cr_segments').innerHTML = segmentEditorRowsHtml(crSegments, 'cr');
@@ -584,14 +841,16 @@ $('#cr_save').addEventListener('click', async () => {
       start: r.start, end: r.end, lux: r.lux === '' ? null : Number(r.lux),
     })),
   };
+  if (crIntervalIndex != null) payload.intervalIndex = crIntervalIndex;
   try {
     const next = await api(`/api/slots/${correctingSlotId}/correct`, { method: 'POST', body: payload });
     $('#correctModal').classList.add('hidden');
     applyNewState(next);
+    const which = next.intervalIndex != null ? `区间 ${next.intervalIndex}：` : '';
     if (next.blockedAfterFinish && next.blockedAfterFinish.length) {
-      toast('warn', `更正完成：曝光 ${fmt(next.beforeExposure)} → ${fmt(next.afterExposure)} lux·min（新总量替换旧总量）。\n重算后以下后续时段不可启动：\n${blockedToastDetail(next.blockedAfterFinish)}`);
+      toast('warn', `${which}更正完成：曝光 ${fmt(next.beforeExposure)} → ${fmt(next.afterExposure)} lux·min（新总量替换旧总量）。\n重算后以下后续时段不可启动：\n${blockedToastDetail(next.blockedAfterFinish)}`);
     } else {
-      toast('success', `更正完成：曝光 ${fmt(next.beforeExposure)} → ${fmt(next.afterExposure)} lux·min，作品已用量已同步重算`);
+      toast('success', `${which}更正完成：曝光 ${fmt(next.beforeExposure)} → ${fmt(next.afterExposure)} lux·min，作品账目已同步重算`);
     }
   } catch (err) {
     if (err.status === 409) {

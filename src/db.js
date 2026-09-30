@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS artworks (
 );
 
 -- 展厅时段
--- status: scheduled 未开始 / running 进行中(冻结原排期) / finished 已结束(以实际值结算)
+-- status: scheduled 未开始 / running 进行中(冻结原排期或恢复后预占) / paused 已暂停(空档不曝光、释放预占) / finished 已结束(以实际值结算)
 CREATE TABLE IF NOT EXISTS slots (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   hall TEXT NOT NULL,
@@ -41,6 +41,11 @@ CREATE TABLE IF NOT EXISTS slots (
   actual_end TEXT,
   actual_lux REAL,
   actual_exposure REAL,
+  -- 暂停/恢复：当前未闭合展出区间的起点（恢复时间）与新预计结束时间；
+  -- 首次暂停前为 NULL（沿用冻结的 planned_start/end 预占）；暂停期间均为 NULL（释放预占）。
+  resume_start TEXT,
+  estimated_end TEXT,
+  pause_count INTEGER NOT NULL DEFAULT 0,   -- 暂停次数（每次 pause +1）
   -- 核算结果：该时段按当前预算是否可启动
   blocked INTEGER NOT NULL DEFAULT 0,
   blocked_reason TEXT NOT NULL DEFAULT '{}'
@@ -94,7 +99,46 @@ CREATE TABLE IF NOT EXISTS slot_correction_segments (
   exposure REAL NOT NULL CHECK (exposure >= 0)
 );
 CREATE INDEX IF NOT EXISTS idx_corr_segs_corr ON slot_correction_segments(correction_id, seg_index);
+
+-- 巡展暂停/恢复：每一次“暂停”或“最终结束（多区间结算）”提交一个已闭合的展出区间。
+-- 各区间按时间递增、互不重叠；暂停空档不计曝光；区间曝光 = Σ(段分钟 × 段照度)。
+CREATE TABLE IF NOT EXISTS slot_intervals (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  slot_id INTEGER NOT NULL REFERENCES slots(id) ON DELETE CASCADE,
+  int_index INTEGER NOT NULL,                 -- 从 1 开始，按时间递增
+  int_start TEXT NOT NULL,                    -- 首段=实际开始；其后=恢复时间
+  int_end TEXT NOT NULL,                      -- 本次暂停时间（或最终结束时间）
+  exposure REAL NOT NULL CHECK (exposure >= 0),
+  UNIQUE (slot_id, int_index)
+);
+
+-- 每个展出区间提交时携带的、完整衔接的照度分段
+CREATE TABLE IF NOT EXISTS slot_interval_segments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  interval_id INTEGER NOT NULL REFERENCES slot_intervals(id) ON DELETE CASCADE,
+  seg_index INTEGER NOT NULL,
+  seg_start TEXT NOT NULL,
+  seg_end TEXT NOT NULL,
+  lux REAL NOT NULL CHECK (lux >= 0),
+  exposure REAL NOT NULL CHECK (exposure >= 0)
+);
+CREATE INDEX IF NOT EXISTS idx_interval_segs_int ON slot_interval_segments(interval_id, seg_index);
 `;
+
+// 旧库迁移：为既有 slots / slot_corrections 补齐本轮新增列（CREATE TABLE IF NOT EXISTS 不会改已有表）
+const MIGRATIONS = [
+  { table: 'slots', column: 'resume_start', ddl: "ALTER TABLE slots ADD COLUMN resume_start TEXT" },
+  { table: 'slots', column: 'estimated_end', ddl: "ALTER TABLE slots ADD COLUMN estimated_end TEXT" },
+  { table: 'slots', column: 'pause_count', ddl: "ALTER TABLE slots ADD COLUMN pause_count INTEGER NOT NULL DEFAULT 0" },
+  { table: 'slot_corrections', column: 'interval_index', ddl: "ALTER TABLE slot_corrections ADD COLUMN interval_index INTEGER" },
+];
+
+function migrate(db) {
+  for (const m of MIGRATIONS) {
+    const cols = db.prepare(`PRAGMA table_info(${m.table})`).all();
+    if (!cols.some((c) => c.name === m.column)) db.exec(m.ddl);
+  }
+}
 
 function openDb() {
   if (DB_PATH !== ':memory:') {
@@ -104,6 +148,7 @@ function openDb() {
   db.pragma('journal_mode = WAL');
   db.pragma('foreign_keys = ON');
   db.exec(SCHEMA);
+  migrate(db);
   return db;
 }
 

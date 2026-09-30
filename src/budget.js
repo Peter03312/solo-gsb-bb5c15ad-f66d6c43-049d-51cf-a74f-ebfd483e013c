@@ -118,10 +118,90 @@ function effectiveSegments(slot, segMap) {
   return [];
 }
 
+// ---------- 暂停 / 恢复：展出区间 ----------
+// 读取全部时段的展出区间及其照度分段（巡展临时闭馆暂停，每次暂停或最终结束闭合一段）。
+function loadIntervals(db) {
+  const rows = db.prepare(`
+    SELECT id, slot_id, int_index, int_start, int_end, exposure
+    FROM slot_intervals ORDER BY slot_id, int_index
+  `).all();
+  const segRows = db.prepare(`
+    SELECT interval_id, seg_index, seg_start, seg_end, lux, exposure
+    FROM slot_interval_segments ORDER BY interval_id, seg_index
+  `).all();
+  const segsByInt = new Map();
+  for (const r of segRows) {
+    if (!segsByInt.has(r.interval_id)) segsByInt.set(r.interval_id, []);
+    segsByInt.get(r.interval_id).push(segmentDto(r, r.seg_index));
+  }
+  const bySlot = new Map();
+  for (const r of rows) {
+    if (!bySlot.has(r.slot_id)) bySlot.set(r.slot_id, []);
+    const mins = minutesBetween(r.int_start, r.int_end);
+    bySlot.get(r.slot_id).push({
+      index: r.int_index,
+      start: r.int_start,
+      end: r.int_end,
+      minutes: mins,
+      exposure: r.exposure,
+      segments: segsByInt.get(r.id) || [],
+    });
+  }
+  return bySlot;
+}
+
+// 已闭合区间累计曝光（暂停空档不计）
+function completedIntervalExposure(slot, intMap) {
+  const list = intMap ? (intMap.get(slot.id) || []) : [];
+  return round3(list.reduce((sum, it) => sum + (it.exposure || 0), 0));
+}
+
+// 进行中时段“当前预占”：
+// - 从未暂停：冻结的原计划（planned_start → planned_end）
+// - 恢复后：恢复时间 → 新预计结束，按冻结的计划照度
+// - 暂停期间：释放预占（0）
+function openReservation(slot) {
+  if (slot.status === 'paused') return 0;
+  if (slot.status !== 'running') return null;
+  if (slot.resume_start != null && slot.estimated_end != null) {
+    const mins = minutesBetween(slot.resume_start, slot.estimated_end);
+    if (mins === null || mins < 0) return 0;
+    return round3(mins * slot.planned_lux);
+  }
+  return plannedExposure(slot);
+}
+
+// 占用时间跨度（同作品时段重叠校验用）：
+// - finished：老时段为实际区间；暂停流时段为各已闭合展出区间（区间之间的空档不占用）
+// - running：冻结原计划，或恢复后 [恢复时间, 新预计结束]
+// - paused：仅已闭合展出区间（暂停空档可排入新时段）
+// - scheduled：计划区间
+function occupiedSpans(slot, intMap) {
+  if (slot.status === 'finished') {
+    if (intMap && intMap.get(slot.id) && intMap.get(slot.id).length) {
+      return intMap.get(slot.id).map((it) => ({ start: it.start, end: it.end }));
+    }
+    if (slot.actual_start != null && slot.actual_end != null) {
+      return [{ start: slot.actual_start, end: slot.actual_end }];
+    }
+    return [];
+  }
+  if (slot.status === 'running') {
+    if (slot.resume_start != null && slot.estimated_end != null) {
+      return [{ start: slot.resume_start, end: slot.estimated_end }];
+    }
+    return [{ start: slot.planned_start, end: slot.planned_end }];
+  }
+  if (slot.status === 'paused') {
+    return (intMap && intMap.get(slot.id) ? intMap.get(slot.id) : []).map((it) => ({ start: it.start, end: it.end }));
+  }
+  return [{ start: slot.planned_start, end: slot.planned_end }];
+}
+
 function loadCorrections(db) {
   const rows = db.prepare(`
     SELECT id, slot_id, reason, before_start, before_end, before_exposure,
-           after_start, after_end, after_exposure, base_version, created_at
+           after_start, after_end, after_exposure, base_version, created_at, interval_index
     FROM slot_corrections ORDER BY slot_id, id
   `).all();
   const segRows = db.prepare(`
@@ -139,6 +219,7 @@ function loadCorrections(db) {
     bySlot.get(r.slot_id).push({
       id: r.id,
       slotId: r.slot_id,
+      intervalIndex: r.interval_index == null ? null : r.interval_index,
       reason: r.reason,
       before: { start: r.before_start, end: r.before_end, exposure: r.before_exposure },
       after: {
@@ -154,12 +235,21 @@ function loadCorrections(db) {
   return bySlot;
 }
 
-function slotDto(slot, artworksById, segMap = null, corrMap = null) {
+function slotDto(slot, artworksById, segMap = null, corrMap = null, intMap = null) {
   const planned = plannedExposure(slot);
-  const actual = slot.status === 'finished' ? slot.actual_exposure : actualExposure(slot);
+  const intervals = intMap ? (intMap.get(slot.id) || []) : [];
+  const isPauseFlow = intervals.length > 0;
+  // 已结束时段：暂停流以区间累计曝光为准，老时段取 actual_exposure
+  const actual = slot.status === 'finished'
+    ? (isPauseFlow ? completedIntervalExposure(slot, intMap) : slot.actual_exposure)
+    : actualExposure(slot);
+  const accumulatedExposure = isPauseFlow
+    ? completedIntervalExposure(slot, intMap)
+    : (slot.status === 'finished' ? (slot.actual_exposure || 0) : 0);
+  const reservation = slot.status === 'running' || slot.status === 'paused' ? openReservation(slot) : null;
   let blockedReason = null;
   try { blockedReason = JSON.parse(slot.blocked_reason || '{}'); } catch { blockedReason = {}; }
-  return {
+  const dto = {
     id: slot.id,
     hall: slot.hall,
     seq: slot.seq,
@@ -178,11 +268,19 @@ function slotDto(slot, artworksById, segMap = null, corrMap = null) {
     corrections: (corrMap && corrMap.get(slot.id)) || [],
     blocked: !!slot.blocked,
     blockedReason,
+    // 暂停/恢复
+    resumeStart: slot.resume_start || null,
+    estimatedEnd: slot.estimated_end || null,
+    pauseCount: slot.pause_count || 0,
+    intervals,
+    accumulatedExposure: round3(accumulatedExposure),
+    currentReservation: reservation,
     artworks: slot.artworkIds.map((id) => {
       const a = artworksById.get(id);
       return { id, name: a ? a.name : `#${id}` };
     }),
   };
+  return dto;
 }
 
 // ---------- 汇总 ----------
@@ -191,6 +289,7 @@ function summarize(db) {
   const slots = loadSlots(db);
   const segMap = loadSegments(db);
   const corrMap = loadCorrections(db);
+  const intMap = loadIntervals(db);
   const artworksById = new Map(artworks.map((a) => [a.id, a]));
 
   const acc = new Map();
@@ -199,14 +298,26 @@ function summarize(db) {
   }
 
   for (const slot of slots) {
-    const expo = plannedExposure(slot);
-    const actual = slot.status === 'finished' ? slot.actual_exposure : null;
+    const intervals = intMap.get(slot.id) || [];
     for (const aid of slot.artworkIds) {
       if (!acc.has(aid)) continue;
       const row = acc.get(aid);
-      if (slot.status === 'finished') row.used += actual || 0;
-      else if (slot.status === 'running') row.reservedRunning += expo || 0;
-      else row.reservedScheduled += expo || 0; // 含被标记为不可启动的时段
+      if (slot.status === 'finished') {
+        // 已用：暂停流取各展出区间累计，老时段取实际总量
+        row.used += intervals.length
+          ? completedIntervalExposure(slot, intMap)
+          : (slot.actual_exposure || 0);
+      } else if (slot.status === 'running' || slot.status === 'paused') {
+        if (intervals.length) {
+          // 已完成区间计入已用；暂停期间释放预占，恢复后按新预计时长预占
+          row.used += completedIntervalExposure(slot, intMap);
+          row.reservedRunning += openReservation(slot) || 0;
+        } else if (slot.status === 'running') {
+          row.reservedRunning += plannedExposure(slot) || 0;
+        }
+      } else {
+        row.reservedScheduled += plannedExposure(slot) || 0; // 含被标记为不可启动的时段
+      }
     }
   }
 
@@ -235,7 +346,7 @@ function summarize(db) {
   return {
     version: db.prepare('SELECT version FROM meta WHERE id = 1').get().version,
     artworks: artworkDtos,
-    slots: slots.map((s) => slotDto(s, artworksById, segMap, corrMap)),
+    slots: slots.map((s) => slotDto(s, artworksById, segMap, corrMap, intMap)),
   };
 }
 
@@ -312,16 +423,27 @@ function sumSegmentExposure(segments) {
 function recomputeBlocked(db) {
   const slots = loadSlots(db);
   const artworks = loadArtworks(db);
+  const intMap = loadIntervals(db);
   const used = new Map(artworks.map((a) => [a.id, a.existing_amount]));
   const names = new Map(artworks.map((a) => [a.id, a.name]));
   const limits = new Map(artworks.map((a) => [a.id, a.limit_amount]));
 
+  // 已用：已结束时段实际/区间总量；进行中（含恢复后）时段的已完成区间 + 当前预占；
+  // 暂停期间只留已完成区间（释放未展预占）。
   for (const s of slots) {
+    const intervals = intMap.get(s.id) || [];
     if (s.status === 'finished') {
-      for (const aid of s.artworkIds) if (used.has(aid)) used.set(aid, used.get(aid) + (s.actual_exposure || 0));
-    } else if (s.status === 'running') {
-      const expo = plannedExposure(s) || 0;
-      for (const aid of s.artworkIds) if (used.has(aid)) used.set(aid, used.get(aid) + expo);
+      const add = intervals.length ? completedIntervalExposure(s, intMap) : (s.actual_exposure || 0);
+      for (const aid of s.artworkIds) if (used.has(aid)) used.set(aid, used.get(aid) + add);
+    } else if (s.status === 'running' || s.status === 'paused') {
+      if (intervals.length) {
+        const done = completedIntervalExposure(s, intMap);
+        const open = openReservation(s) || 0;
+        for (const aid of s.artworkIds) if (used.has(aid)) used.set(aid, used.get(aid) + done + open);
+      } else if (s.status === 'running') {
+        const expo = plannedExposure(s) || 0;
+        for (const aid of s.artworkIds) if (used.has(aid)) used.set(aid, used.get(aid) + expo);
+      }
     }
   }
 
@@ -374,9 +496,13 @@ module.exports = {
   loadSlots,
   loadSegments,
   loadCorrections,
+  loadIntervals,
   effectiveSegments,
   plannedExposure,
   actualExposure,
+  completedIntervalExposure,
+  openReservation,
+  occupiedSpans,
   validateSegments,
   sumSegmentExposure,
   summarize,

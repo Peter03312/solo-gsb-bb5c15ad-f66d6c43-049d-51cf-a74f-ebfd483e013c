@@ -8,7 +8,8 @@
 - **分段更正**：已结束时段可按**原实际起止**提交带理由的完整分段更正；记录更正前后曝光和时间，**新总量替换旧总量、不重复累计**，并同步重算作品已用量、后续时段不可启动状态与缺口。
 - **整批排期**：未开始时段在草稿中统一编辑后整批提交；同一作品时段重叠、或“已用 + 预占”超上限时 **拒绝整批**，逐条指出冲突作品与时段。
 - **生命周期**：时段开始即冻结原排期并保留预占；结束时补记实际起止与照度（单一照度或多段），**实际曝光替换该时段预占**；结算超量后按开始时间/编号顺序标出不可启动时段与缺口并禁止启动。
-- **乐观并发**：所有调整（含多段结算与分段更正）携带当前版本号，过期版本返回 409 与最新预算，失败不改变结算和版本。
+- **临时闭馆：暂停 / 恢复（本轮新增）**：进行中时段可多次暂停；每次暂停提交**本段展出区间起止与完整衔接的照度分段**（首次可录实际开始），已完成区间计入已用、**暂停空档不计曝光并释放未展预占**；恢复时提交**恢复时间与新预计结束时间**，按冻结的计划照度 × 新预计时长重新预占，并重算作品余额与后续时段缺口；最终结束按各展出区间累计结算。各展出区间按时间递增、互不重叠，且不与同作品其他时段重叠。
+- **乐观并发**：所有调整（含多段结算、暂停/恢复与分段更正）携带当前版本号，过期版本返回 409 与最新预算，失败不改变结算和版本。
 
 ## 一键启动（Docker Compose，推荐）
 
@@ -53,8 +54,8 @@ npm start
 ## 计算与校验规则
 
 - **曝光量** = （结束 − 开始，分钟）× 照度 lux，单位 **lux·min**。
-- **已用** = 作品既有累计量 + 所有已结束时段的**实际**曝光。
-- **预占** = 进行中时段的（冻结）计划曝光 + 所有未开始时段的计划曝光之和。
+- **已用** = 作品既有累计量 + 所有已结束时段的**实际**曝光 + 暂停/进行中时段**已闭合展出区间**的曝光。
+- **预占** = 进行中时段的（冻结）计划曝光（暂停/恢复后为「恢复时间→新预计结束」按冻结计划照度计算）+ 所有未开始时段的计划曝光之和；**暂停期间该时段预占释放为 0**。
 - **余额** = 上限 − 已用 − 预占；余额为负即超量。
 - 排期整批保存时校验：
   1. 时间格式合法、结束晚于开始、照度/累计量非负（无效时序或负值一律拒绝）；
@@ -75,19 +76,40 @@ npm start
   4. 每次更正留痕：更正前后的实际起止、曝光总量、理由、所基于版本、时间戳及“更正后分段”快照，可在页面「分段更正记录」中查看，也随该时段在 `GET /api/state` 的 `corrections` 字段返回。
 - **并发版本**：每次成功变更版本号 +1。请求必须携带当前 `version`；不匹配时返回 `409 VERSION_STALE` 与最新完整预算，前端自动刷新后需重新调整提交。
 
+### 暂停 / 恢复（临时闭馆）规则
+
+1. 时段状态在 `scheduled → running →（paused ⇄ running，可多次）→ finished` 间流转；`paused` 为本轮新增。
+2. **暂停 `POST /api/slots/:id/pause`**（必须携带 `version`）：提交 `{version, start, end, segments[]}`。
+   - 首次暂停：`start` 可录实际开始；其后各次：`start` 必须**等于当前恢复时间**；
+   - `end`（暂停时间）必须严格晚于本段 `start`；`segments` 须首尾衔接、无重叠、完整覆盖 `[start, end]`；
+   - 成功后写入一个已闭合展出区间：区间曝光 = Σ(段分钟×照度)，**计入作品已用**；时段转 `paused`，**未展部分预占释放（=0）**，暂停空档不曝光；
+   - 本区间还不得与同作品其他时段（未开始计划区间 / 进行中冻结或恢复后预占区间 / 已结束实际区间 / 其他已闭合区间）重叠，否则 `422 INTERVAL_OVERLAP` 整次拒绝。
+3. **恢复 `POST /api/slots/:id/resume`**（必须携带 `version`）：提交 `{version, resumeTime, estimatedEnd}`。
+   - `resumeTime` 必须严格晚于上次暂停终点；`estimatedEnd` 必须严格晚于 `resumeTime`；
+   - 时段转 `running`，按冻结的**计划照度**与「新预计时长」重新预占：(estimatedEnd − resumeTime) × plannedLux；
+   - 恢复后的预占区间不得与同作品其他时段重叠，否则 `422 INTERVAL_OVERLAP`；恢复后自动重算作品余额与后续未开始时段缺口。
+4. **最终结束**：
+   - 恢复后处于 `running`：`POST /api/slots/:id/settle` 提交最后区间 `{version, start, end, segments[]}`，`start` 必须等于恢复时间；总量 = 各区间曝光之和；
+   - 处于 `paused`：可直接 `POST /api/slots/:id/settle`（仅带 `version`，不带起止/分段），按已提交的各展出区间累计收尾，暂停空档不计曝光。
+5. 各展出区间**按时间递增、互不重叠**；时间或分段无效、版本过期时整次拒绝——**状态、账目与版本均不变**（版本过期返回 409 与最新预算）。
+6. **区间更正**：含已闭合展出区间的时段（暂停中 / 恢复后 / 已结束均可）调 `POST /api/slots/:id/correct` 时必须带 `intervalIndex`，新分段完整覆盖该区间原起止；新区间曝光替换旧值，总量与作品账目、后续缺口同步重算，更正记录标注区间号。
+7. 旧的单一照度 `finish` 与未暂停时段的多段 `settle` / `correct` 行为保持不变；对已有展出区间的 running 时段调用旧 `finish` 会被拒绝（请用区间结算，避免账实不符）。
+
 ## 接口一览
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/state` | 最新版本、作品预算汇总、全部时段（含 `actualSegments` / `corrections`）及不可启动核算结果 |
+| GET | `/api/state` | 最新版本、作品预算汇总、全部时段（含 `actualSegments` / `corrections` / `intervals` / 暂停字段）及不可启动核算结果 |
 | POST | `/api/artworks` | 录入作品（body 带 `version`） |
 | PUT | `/api/artworks/:id` | 修改作品上限/既有量等 |
 | DELETE | `/api/artworks/:id` | 删除作品（被时段引用时拒绝） |
 | POST | `/api/schedule` | **整批替换未开始时段**（body：`{version, slots:[...]}`） |
 | POST | `/api/slots/:id/start` | 启动时段：冻结原排期、保留预占 |
-| POST | `/api/slots/:id/finish` | 结束补记（保持可用）：`{actualStart, actualEnd, actualLux}` 单一照度结算，无需版本 |
-| POST | `/api/slots/:id/settle` | **多段照度结算（进行中）**：`{version, actualStart, actualEnd, segments:[{start,end,lux}]}` |
-| POST | `/api/slots/:id/correct` | **分段更正（已结束）**：`{version, reason, segments:[{start,end,lux}]}`，区间沿用原实际起止 |
+| POST | `/api/slots/:id/pause` | **暂停（临时闭馆）**：`{version, start, end, segments[]}` 闭合本段展出区间，计入已用、释放预占 |
+| POST | `/api/slots/:id/resume` | **恢复展出**：`{version, resumeTime, estimatedEnd}`，按新预计时长与计划照度重新预占 |
+| POST | `/api/slots/:id/finish` | 结束补记（保持可用，仅限未暂停过的时段）：`{actualStart, actualEnd, actualLux}` 单一照度结算，无需版本 |
+| POST | `/api/slots/:id/settle` | **多段照度结算**：未暂停用 `{version, actualStart, actualEnd, segments[]}`；暂停恢复后用 `{version, start, end, segments[]}` 闭合最后区间；暂停中可仅带 `{version}` 按已展区间直接收尾 |
+| POST | `/api/slots/:id/correct` | **分段更正**：`{version, reason, segments[]}`（区间沿用原实际起止）；含展出区间的时段须带 `intervalIndex` |
 
 ### 多段结算与分段更正：HTTP 调用示例
 
@@ -158,19 +180,120 @@ curl -s -X POST http://localhost:8080/api/slots/1/correct \
     { "index": 2, "start": "2026-09-29T10:10", "end": "2026-09-29T11:50", "minutes": 100, "lux": 150, "exposure": 15000 }
   ],
   "corrections": [
-    { "id": 1, "reason": "…", "baseVersion": 2, "createdAt": "2026-09-30T12:00:00.000Z",
+    { "id": 1, "intervalIndex": null, "reason": "…", "baseVersion": 2, "createdAt": "2026-09-30T12:00:00.000Z",
       "before": { "start": "…", "end": "…", "exposure": 22400 },
       "after":  { "start": "…", "end": "…", "exposure": 21000, "segments": [ /* 同上分段快照 */ ] } }
   ]
 }
 ```
 
-## 页面用法（本轮新增）
+### 暂停 / 恢复：HTTP 调用示例
+
+临时闭馆，暂停进行中时段（首次可录实际开始；本段 09:00–10:00 为 200 lux，10:00–11:00 降为 100 lux）：
+
+```bash
+curl -s -X POST http://localhost:8080/api/slots/2/pause \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "version": 4,
+    "start": "2026-09-30T09:00",
+    "end":   "2026-09-30T11:00",
+    "segments": [
+      { "start": "2026-09-30T09:00", "end": "2026-09-30T10:00", "lux": 200 },
+      { "start": "2026-09-30T10:00", "end": "2026-09-30T11:00", "lux": 100 }
+    ]
+  }'
+```
+
+返回完整预算状态，另含 `pausedInterval`（刚闭合的区间与分段）、`accumulatedExposure`（累计已展）、
+`currentReservation`（暂停期间为 **0**，即预占已释放）、`blockedAfterFinish`（重算后的后续缺口）。
+此时段在 `GET /api/state` 中：
+
+```json
+{
+  "id": 2, "status": "paused",
+  "resumeStart": null, "estimatedEnd": null, "pauseCount": 1,
+  "accumulatedExposure": 18000, "currentReservation": 0,
+  "intervals": [
+    { "index": 1, "start": "2026-09-30T09:00", "end": "2026-09-30T11:00",
+      "minutes": 120, "exposure": 18000,
+      "segments": [
+        { "index": 1, "start": "…09:00", "end": "…10:00", "minutes": 60, "lux": 200, "exposure": 12000 },
+        { "index": 2, "start": "…10:00", "end": "…11:00", "minutes": 60, "lux": 100, "exposure": 6000 }
+      ] }
+  ]
+}
+```
+
+13:00 恢复展出，新预计 17:00 结束（按冻结计划照度 200 lux × 240 分钟重新预占 48000）：
+
+```bash
+curl -s -X POST http://localhost:8080/api/slots/2/resume \
+  -H 'Content-Type: application/json' \
+  -d '{"version": 5, "resumeTime": "2026-09-30T13:00", "estimatedEnd": "2026-09-30T17:00"}'
+```
+
+返回 `{ …state, resumedAt, estimatedEnd, currentReservation, accumulatedExposure, blockedAfterFinish }`；
+时段回到 `running` 且带 `resumeStart/estimatedEnd`。恢复后再次暂停时，本段 `start` 必须等于 `resumeTime`。
+
+最终结束有两种方式：
+
+```bash
+# A) 恢复后（running）闭合最后区间，start 必须等于恢复时间
+curl -s -X POST http://localhost:8080/api/slots/2/settle \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "version": 6,
+    "start": "2026-09-30T13:00", "end": "2026-09-30T17:00",
+    "segments": [ { "start": "2026-09-30T13:00", "end": "2026-09-30T17:00", "lux": 200 } ]
+  }'
+
+# B) 暂停中（paused）直接按已提交区间累计收尾，暂停空档不曝光
+curl -s -X POST http://localhost:8080/api/slots/2/settle \
+  -H 'Content-Type: application/json' -d '{"version": 5}'
+```
+
+两种方式返回均含 `justFinishedExposure`（全部展出区间累计）、`justIntervals`（各区间明细）与
+`blockedAfterFinish`。对暂停流时段的某一已闭合区间做分段更正时带 `intervalIndex`：
+
+```bash
+curl -s -X POST http://localhost:8080/api/slots/2/correct \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "version": 7,
+    "intervalIndex": 1,
+    "reason": "首段照度计复核为 180 lux",
+    "segments": [
+      { "start": "2026-09-30T09:00", "end": "2026-09-30T10:00", "lux": 180 },
+      { "start": "2026-09-30T10:00", "end": "2026-09-30T11:00", "lux": 100 }
+    ]
+  }'
+```
+
+时序/分段/区间编号或同作品时段重叠不合法时，暂停、恢复、结算、更正均返回 422 整次拒绝
+（错误码 `VALIDATION` / `SEGMENTS_INVALID` / `INTERVAL_OVERLAP` / `NOT_RUNNING` / `NOT_PAUSED`），
+**状态、账目与版本不变**；版本过期统一 `409 VERSION_STALE` 并返回最新预算。
+
+## 页面用法
+
+### 暂停 / 恢复（本轮新增）
+
+- **进行中 / 已暂停 / 已结束时段**表新增暂停状态展示：徽标区分「进行中·冻结」「进行中·已暂停 N 次」「已暂停」「已结束」；
+  每个暂停流时段按**展出区间**列出区间起止、区间内分段照度与暂停空档（标注“暂停中：空档不曝光，预占已释放”）；
+  实际曝光列显示**累计曝光（计入已用）**与**当前预占**（暂停中为 0）。
+- 进行中时段点 **⏸ 暂停**：弹窗填写本段开始（首次可改，恢复后锁定为恢复时间）、暂停时间与完整衔接分段，实时显示本段曝光；
+  成功后作品已用/预占/余额与后续缺口即时刷新。
+- 已暂停时段点 **▶ 恢复**：填写恢复时间（默认上次暂停终点，需晚于该时间）与新预计结束时间，实时预览按计划照度计的重新预占；
+  与同作品其他时段重叠会整次拒绝并提示冲突时段。
+- 已暂停时段可点 **结束（按已展区间）** 直接收尾；恢复后点 **结束并结算** 提交自恢复时间起的最后区间。允许多次暂停/恢复。
+- 含展出区间的时段点 **分段更正**：弹窗顶部下拉选择要更正的区间（区间起止固定），提交后总量、累计曝光与缺口同步重算。
+
+### 多段结算与更正（既有能力）
 
 - **进行中 / 已结束时段**表的“实际起止 / 分段”“分段照度”“实际曝光”三列展示分段明细；旧单一照度结算显示为单段。
 - 进行中时段点 **结束补记**：弹窗勾选「按多段实际照度结算」即可增删多段（开始/结束时间、照度），实时显示 Σ 曝光；不勾选则保持原有单一照度补记（对应 `finish`，无需版本）。
 - 已结束时段点 **分段更正**：弹窗显示原实际区间（不可改），填写理由并提交完整分段；成功后页面顶部提示更正前后曝光，作品已用量与后续不可启动状态即时刷新。
-- 页面新增 **分段更正记录** 卡片：按时间倒序展示每次更正的理由、实际区间、更正前后曝光、变化量与更正后分段。
+- 页面新增 **分段更正记录** 卡片：按时间倒序展示每次更正的理由、实际区间、更正前后曝光、变化量与更正后分段（暂停流的区间更正会标注对应区间号）。
 
 ## 快速体验超量拦截
 
