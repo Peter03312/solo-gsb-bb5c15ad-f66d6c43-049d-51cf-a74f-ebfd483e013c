@@ -1,0 +1,19 @@
+services:
+  lightbudget:
+    build: .
+    image: light-budget-workbench:latest
+    container_name: light-budget-workbench
+    ports:
+      - "${PORT:-8080}:8080"
+    environment:
+      # 容器内监听端口（左侧宿主端口通过 PORT 变量映射）
+      PORT: "8080"
+      HOST: "0.0.0.0"
+      DB_PATH: /app/data/lightbudget.db
+    volumes:
+      # SQLite 数据持久化到命名卷；删除卷即恢复初始演示数据
+      - lightbudget-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  lightbudget-data:

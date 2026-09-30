@@ -1,0 +1,16 @@
+{
+  "name": "light-budget-workbench",
+  "version": "1.0.0",
+  "description": "巡展作品光照预算 Web 工作台（Node.js + SQLite）",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "initdb": "node -e \"require('./src/db').resetDb()\""
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.10.0"
+  }
+}
