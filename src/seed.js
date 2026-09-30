@@ -70,6 +70,27 @@ function seed(db) {
   }).lastInsertRowid;
   addLinks(s5, [artIds.w3]);
 
+  // 6. 已暂停（临时闭馆演示）：09-30 14:00 开馆，15:00 闭馆暂停（已完成 60 分×160=9600）；
+  //    已释放未展预占，等待恢复。actual_exposure 存“已完成区间累计曝光”。
+  const s6 = insSlot.run({
+    hall: '四号厅', seq: 6, status: 'paused',
+    planned_start: '2026-09-30T14:00', planned_end: '2026-09-30T17:00', planned_lux: 160,
+    actual_start: '2026-09-30T14:00', actual_end: '2026-09-30T15:00', actual_lux: null,
+    actual_exposure: 9600,
+  }).lastInsertRowid;
+  addLinks(s6, [artIds.w3]);
+  const insIv = db.prepare(`
+    INSERT INTO slot_intervals (slot_id, int_index, int_start, int_end, planned_end, exposure, is_active)
+    VALUES (?, ?, ?, ?, ?, ?, 0)
+  `);
+  const insIvSeg = db.prepare(`
+    INSERT INTO slot_interval_segments (interval_id, seg_index, seg_start, seg_end, lux, exposure)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `);
+  const iv1 = insIv.run(s6, 1, '2026-09-30T14:00', '2026-09-30T15:00',
+    '2026-09-30T15:00', 9600).lastInsertRowid;
+  insIvSeg.run(iv1, 1, '2026-09-30T14:00', '2026-09-30T15:00', 160, 9600);
+
   const tx = db.transaction(() => recomputeBlocked(db));
   tx.immediate();
   return true;

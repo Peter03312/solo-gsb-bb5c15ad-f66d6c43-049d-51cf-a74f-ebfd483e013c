@@ -28,7 +28,7 @@
     <section class="card">
       <div class="card-head">
         <h2>作品预算</h2>
-        <div class="hint">已用 = 既有累计 + 已结束时段实际曝光；预占 = 进行中（冻结）+ 未开始时段；余额 = 上限 − 已用 − 预占</div>
+        <div class="hint">已用 = 既有累计 + 已结束/已暂停的已完成展出区间曝光；预占 = 进行中（冻结或当前恢复区间）+ 未开始时段；暂停空档不预占；余额 = 上限 − 已用 − 预占</div>
         <button class="btn btn-primary" id="addArtworkBtn">＋ 录入作品</button>
       </div>
       <div class="table-wrap">
@@ -54,8 +54,8 @@
     <!-- 进行中 / 已结束（冻结区） -->
     <section class="card">
       <div class="card-head">
-        <h2>进行中 / 已结束时段</h2>
-        <div class="hint">时段开始后原排期冻结并保留预占；结束时可补记单一照度，或按多段实际照度结算；已结束时段可按原实际起止提交带理由的完整分段更正（新总量替换旧总量）</div>
+        <h2>进行中 / 已暂停 / 已结束时段</h2>
+        <div class="hint">临时闭馆可对进行中时段「暂停」：提交当前展出区间与完整照度分段后，已完成区间计入已用、释放未展预占；「恢复」时提交恢复时间与新预计结束，按新时长×计划照度重新预占（可多次暂停，空档不计曝光）。最终结束仍走「结束补记」的多段结算（覆盖最后一个展出区间）</div>
       </div>
       <div class="table-wrap">
         <table class="data-table" id="frozenTable">
@@ -63,7 +63,7 @@
             <tr>
               <th>#</th><th>展厅</th><th>状态</th>
               <th>计划起止</th><th class="num">计划照度</th><th class="num">计划曝光</th>
-              <th>实际起止 / 分段</th><th class="num">分段照度(lux)</th><th class="num">实际曝光</th>
+              <th>展出区间 / 分段</th><th class="num">分段照度(lux)</th><th class="num">累计曝光 / 当前预占</th>
               <th>展出作品</th><th>操作</th>
             </tr>
           </thead>
@@ -141,7 +141,8 @@
   <div class="modal-mask hidden" id="finishModal">
     <div class="modal modal-wide">
       <h3>结束时段 · 补记实际值</h3>
-      <div class="form-row">
+      <div id="fn_intervalHint" class="hint" style="margin-bottom:10px"></div>
+      <div class="form-row" id="fn_multiRow">
         <label class="seg-toggle">
           <input type="checkbox" id="fn_multi" /> 按多段实际照度结算（各段首尾衔接、完整覆盖实际区间）
         </label>
@@ -167,6 +168,44 @@
     </div>
   </div>
 
+  <!-- 暂停弹窗（临时闭馆） -->
+  <div class="modal-mask hidden" id="pauseModal">
+    <div class="modal modal-wide">
+      <h3 id="pa_title">暂停时段 · 临时闭馆</h3>
+      <div class="form-row" id="pa_startRow">
+        <label id="pa_startLabel">本段实际开始（首次可录实际开始）</label>
+        <input type="datetime-local" id="pa_start" />
+      </div>
+      <div class="form-row"><label>暂停时间（本段终点，晚于起点）</label><input type="datetime-local" id="pa_end" /></div>
+      <div class="seg-head">
+        <label>本展出区间的完整照度分段（首尾衔接、无重叠、完整覆盖）</label>
+        <button type="button" class="btn btn-sm" id="pa_addSeg">＋ 添加分段</button>
+      </div>
+      <div id="pa_segments"></div>
+      <div class="form-row computed">本区间曝光：<strong id="pa_preview">–</strong> lux·min；暂停后释放未展预占</div>
+      <div class="form-error hidden" id="pa_error"></div>
+      <div class="modal-actions">
+        <button class="btn" data-close>取消</button>
+        <button class="btn btn-primary" id="pa_save">确认暂停</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 恢复弹窗（重新开馆） -->
+  <div class="modal-mask hidden" id="resumeModal">
+    <div class="modal">
+      <h3 id="rs_title">恢复展出 · 重新开馆</h3>
+      <div class="form-row"><label>恢复时间（晚于上次暂停终点）</label><input type="datetime-local" id="rs_at" /></div>
+      <div class="form-row"><label>新预计结束时间</label><input type="datetime-local" id="rs_end" /></div>
+      <div class="form-row computed">恢复后预占：<strong id="rs_preview">–</strong> lux·min（新时长 × 计划照度 <span id="rs_lux"></span>）</div>
+      <div class="form-error hidden" id="rs_error"></div>
+      <div class="modal-actions">
+        <button class="btn" data-close>取消</button>
+        <button class="btn btn-primary" id="rs_save">确认恢复</button>
+      </div>
+    </div>
+  </div>
+
   <!-- 分段更正弹窗（仅已结束时段） -->
   <div class="modal-mask hidden" id="correctModal">
     <div class="modal modal-wide">
@@ -179,11 +218,17 @@
         <label>更正理由（必填）</label>
         <input type="text" id="cr_reason" maxlength="200" placeholder="如：现场补光在 11:00 后由 200 lux 调整为 120 lux" />
       </div>
-      <div class="seg-head">
-        <label>更正后的完整分段（须首尾衔接、无重叠、完整覆盖原区间）</label>
-        <button type="button" class="btn btn-sm" id="cr_addSeg">＋ 添加分段</button>
+      <div id="cr_intervalBox" class="hidden">
+        <div class="hint" style="margin-bottom:8px">该时段曾暂停/恢复，请逐展出区间分别提交完整分段（暂停空档无需分段）：</div>
+        <div id="cr_intervals"></div>
       </div>
-      <div id="cr_segments"></div>
+      <div id="cr_singleBox">
+        <div class="seg-head">
+          <label>更正后的完整分段（须首尾衔接、无重叠、完整覆盖原区间）</label>
+          <button type="button" class="btn btn-sm" id="cr_addSeg">＋ 添加分段</button>
+        </div>
+        <div id="cr_segments"></div>
+      </div>
       <div class="form-row computed">更正后曝光：<strong id="cr_preview">–</strong> lux·min（将替换原总量，不重复累计）</div>
       <div class="form-error hidden" id="cr_error"></div>
       <div class="modal-actions">

@@ -26,7 +26,8 @@ CREATE TABLE IF NOT EXISTS artworks (
 );
 
 -- 展厅时段
--- status: scheduled 未开始 / running 进行中(冻结原排期) / finished 已结束(以实际值结算)
+-- status: scheduled 未开始 / running 进行中(冻结原排期；恢复后亦为 running) /
+--         paused 已暂停(临时闭馆，空档不计曝光、不占预占) / finished 已结束(以实际值结算)
 CREATE TABLE IF NOT EXISTS slots (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   hall TEXT NOT NULL,
@@ -94,6 +95,38 @@ CREATE TABLE IF NOT EXISTS slot_correction_segments (
   exposure REAL NOT NULL CHECK (exposure >= 0)
 );
 CREATE INDEX IF NOT EXISTS idx_corr_segs_corr ON slot_correction_segments(correction_id, seg_index);
+
+-- 展出区间（暂停/恢复模型）：一个时段可由多个互不重叠、按时间递增的展出区间组成，
+-- 暂停空档不是区间、不计曝光。is_active=1：进行中（running）时段“当前未完结”的
+-- 最后一段（start=首次实际开始或恢复时间，planned_end=新预计结束，按计划照度预占）；
+-- is_active=0：已完成区间（暂停时提交或最终结束的区间，exposure 为该区间分段总量）。
+-- 未使用暂停功能的旧时段没有区间行：读取时由 actual/planned 字段合成（兼容单段结算）。
+CREATE TABLE IF NOT EXISTS slot_intervals (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  slot_id INTEGER NOT NULL REFERENCES slots(id) ON DELETE CASCADE,
+  int_index INTEGER NOT NULL,                 -- 从 1 开始，按时间递增
+  int_start TEXT NOT NULL,                    -- 本段实际开始（首次实际开始 / 恢复时间）
+  int_end TEXT,                               -- 本段终点：暂停时为暂停时间；进行中为 NULL
+  planned_end TEXT NOT NULL,                  -- 本段新预计结束（预占据此计算；完成后留档）
+  exposure REAL,                              -- 已完成区间的分段曝光总量；进行中为 NULL
+  is_active INTEGER NOT NULL DEFAULT 0       -- 1 = 当前进行中的未完结区间（每时段至多一条）
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_slot_interval_active
+  ON slot_intervals(slot_id) WHERE is_active = 1;
+CREATE INDEX IF NOT EXISTS idx_slot_intervals_slot ON slot_intervals(slot_id, int_index);
+
+-- 各展出区间内的实际照度分段（结构与 slot_segments 一致：首尾衔接、无重叠、完整覆盖该区间）。
+-- slot_segments 仅保留给未使用暂停功能的旧结算/更正链路；暂停模型以本表为权威数据。
+CREATE TABLE IF NOT EXISTS slot_interval_segments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  interval_id INTEGER NOT NULL REFERENCES slot_intervals(id) ON DELETE CASCADE,
+  seg_index INTEGER NOT NULL,
+  seg_start TEXT NOT NULL,
+  seg_end TEXT NOT NULL,
+  lux REAL NOT NULL CHECK (lux >= 0),
+  exposure REAL NOT NULL CHECK (exposure >= 0)
+);
+CREATE INDEX IF NOT EXISTS idx_int_segs_int ON slot_interval_segments(interval_id, seg_index);
 `;
 
 function openDb() {

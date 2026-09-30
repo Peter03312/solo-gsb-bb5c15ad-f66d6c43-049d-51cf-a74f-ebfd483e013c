@@ -88,12 +88,14 @@ const server = http.createServer(async (req, res) => {
     }
 
     // 时段生命周期
-    const mSlot = pathname.match(/^\/api\/slots\/(\d+)\/(start|finish|settle|correct)$/);
+    const mSlot = pathname.match(/^\/api\/slots\/(\d+)\/(start|finish|settle|correct|pause|resume)$/);
     if (mSlot && req.method === 'POST') {
       const id = H.parseId(mSlot[1]);
       if (mSlot[2] === 'start') return sendJson(res, 200, H.startSlot(db, id));
       if (mSlot[2] === 'finish') return sendJson(res, 200, H.finishSlot(db, id, body || {}));
       if (mSlot[2] === 'settle') return sendJson(res, 200, H.settleSlot(db, id, body || {}));
+      if (mSlot[2] === 'pause') return sendJson(res, 200, H.pauseSlot(db, id, body || {}));
+      if (mSlot[2] === 'resume') return sendJson(res, 200, H.resumeSlot(db, id, body || {}));
       return sendJson(res, 200, H.correctSlot(db, id, body || {}));
     }
 

@@ -22,7 +22,8 @@ function minutes(s, e) {
   return Math.round((me - ms) / 60000);
 }
 function statusBadge(s) {
-  if (s.status === 'running') return '<span class="badge badge-running">进行中·冻结</span>';
+  if (s.status === 'paused') return '<span class="badge badge-paused">已暂停·闭馆</span>';
+  if (s.status === 'running') return '<span class="badge badge-running">进行中' + (s.activeInterval ? '·已恢复' : '·冻结') + '</span>';
   if (s.status === 'finished') return '<span class="badge badge-finished">已结束</span>';
   if (s.blocked) return '<span class="badge badge-blocked">不可启动</span>';
   return '<span class="badge badge-scheduled">未开始</span>';
@@ -118,16 +119,93 @@ function segmentExpoHtml(total, segs) {
   return `<div class="seg-total">${fmt(total)}${detail}</div>`;
 }
 
+// 展出区间视图（暂停模型）：逐区间展示分段，并标出暂停空档
+function intervalsHtml(slot) {
+  const ivs = slot.intervals || [];
+  if (!ivs.length) return null;
+  const blocks = [];
+  for (let i = 0; i < ivs.length; i++) {
+    const iv = ivs[i];
+    const stateTxt = iv.active
+      ? '<span class="iv-state live">进行中（恢复后预占至 ' + esc(iv.plannedEnd.slice(11)) + '）</span>'
+      : '<span class="iv-state done">已完成</span>';
+    const segLines = iv.segments.length
+      ? iv.segments.map((g) =>
+          `<div class="seg-line mono-span">${esc(g.start.slice(11))}～${esc(g.end.slice(11))}</div>`).join('')
+      : (iv.active ? '<div class="seg-line mono-span">（恢复后展出中…）</div>' : '');
+    blocks.push(`
+      <div class="iv-block ${iv.active ? 'active-iv' : 'paused-iv'}">
+        <div class="iv-head">
+          <span class="iv-tag">区间 ${iv.index}</span>${stateTxt}
+        </div>
+        ${segLines}
+      </div>`);
+    // 暂停空档：本区间终点 → 下一区间起点（最终区间之后的空档不显示）
+    const next = ivs[i + 1];
+    if (next && iv.end) {
+      blocks.push(`<div class="iv-gap">⏸ 暂停空档 ${esc(iv.end.slice(11))} ～ ${esc(next.start.slice(11))}（不计曝光、不预占）</div>`);
+    }
+  }
+  return blocks.join('');
+}
+// 各区间分段照度明细
+function intervalLuxHtml(slot) {
+  const ivs = slot.intervals || [];
+  return ivs.map((iv) =>
+    `<div class="iv-block ${iv.active ? 'active-iv' : ''}">` +
+    iv.segments.map((g) =>
+      `<div class="seg-line num">${fmt(g.lux)}<span class="seg-min">${fmt(g.minutes)} 分</span></div>`).join('') +
+    (iv.active ? '<div class="seg-line num" style="color:var(--muted)">计划 ' + fmt(iv.plannedLux) + '<span class="seg-min">恢复后预占</span></div>' : '') +
+    '</div>'
+  ).join('<div class="iv-gap" style="border:0;padding:0;margin:-4px 0 2px">⏸</div>');
+}
+// 累计曝光 / 当前预占 单元格
+function cumulativeCell(slot) {
+  if (slot.intervals && slot.intervals.length) {
+    const cum = slot.cumulativeExposure;
+    const res = slot.status === 'running' ? slot.currentReserved : 0;
+    return `<div class="seg-total num">累计 ${fmt(cum)}</div>` +
+      `<div class="reserved-detail num">${slot.status === 'paused' ? '暂停中：预占 0' : '当前预占 ' + fmt(res)}</div>`;
+  }
+  if (slot.actualExposure === null) return '—';
+  return segmentExpoHtml(slot.actualExposure, slot.actualSegments);
+}
+
 function renderFrozen() {
   const tb = $('#frozenTable tbody');
   const rows = state.slots
-    .filter((s) => s.status === 'running' || s.status === 'finished')
+    .filter((s) => s.status === 'running' || s.status === 'finished' || s.status === 'paused')
     .sort((a, b) => a.seq - b.seq);
   if (!rows.length) {
-    tb.innerHTML = '<tr class="empty-row"><td colspan="11">暂无进行中或已结束时段</td></tr>';
+    tb.innerHTML = '<tr class="empty-row"><td colspan="11">暂无进行中、已暂停或已结束时段</td></tr>';
     return;
   }
-  tb.innerHTML = rows.map((s) => `
+  tb.innerHTML = rows.map((s) => {
+    const isPausedModel = s.intervals && s.intervals.length > 0;
+    const coverCell = isPausedModel
+      ? intervalsHtml(s)
+      : (s.actualStart
+        ? `<div class="seg-cover mono-span">${esc(s.actualStart)}<br>～ ${esc(s.actualEnd)}</div>${
+            s.actualSegments.length > 1
+              ? s.actualSegments.map((g) => `<div class="seg-line mono-span">${esc(g.start.slice(11))}～${esc(g.end.slice(11))}</div>`).join('')
+              : ''}`
+        : '—（冻结中）');
+    const luxCell = isPausedModel
+      ? intervalLuxHtml(s)
+      : (s.actualStart === null ? '—' : segmentLuxHtml(s.actualSegments));
+    let actions = '';
+    if (s.status === 'running') {
+      actions = `<div class="row-actions">
+          <button class="btn btn-sm btn-primary" data-act="finish" data-id="${s.id}">结束补记</button>
+          <button class="btn btn-sm" data-act="pause" data-id="${s.id}">⏸ 暂停</button>
+        </div>`;
+    } else if (s.status === 'paused') {
+      actions = `<button class="btn btn-sm btn-primary" data-act="resume" data-id="${s.id}">▶ 恢复展出</button>`;
+    } else {
+      actions = `<div class="row-actions"><span style="color:var(--muted)">已结算</span>
+             <button class="btn btn-sm" data-act="correct" data-id="${s.id}">分段更正</button></div>`;
+    }
+    return `
     <tr>
       <td>${s.seq}</td>
       <td>${esc(s.hall)}</td>
@@ -137,25 +215,13 @@ function renderFrozen() {
       </td>
       <td class="num">${fmt(s.plannedLux)}</td>
       <td class="num">${fmt(s.plannedExposure)}</td>
-      <td>
-        ${s.actualStart
-          ? `<div class="seg-cover mono-span">${esc(s.actualStart)}<br>～ ${esc(s.actualEnd)}</div>${
-              s.actualSegments.length > 1
-                ? s.actualSegments.map((g) => `<div class="seg-line mono-span">${esc(g.start.slice(11))}～${esc(g.end.slice(11))}</div>`).join('')
-                : ''}`
-          : '—（冻结中）'}
-      </td>
-      <td class="num">${s.actualStart === null ? '—' : segmentLuxHtml(s.actualSegments)}</td>
-      <td class="num">${s.actualExposure === null ? '—' : segmentExpoHtml(s.actualExposure, s.actualSegments)}</td>
+      <td>${coverCell}</td>
+      <td class="num">${luxCell}</td>
+      <td class="num">${cumulativeCell(s)}</td>
       <td><div class="art-chips">${s.artworks.map((a) => `<span class="chip">${esc(a.name)}</span>`).join('')}</div></td>
-      <td>
-        ${s.status === 'running'
-          ? `<button class="btn btn-sm btn-primary" data-act="finish" data-id="${s.id}">结束补记</button>`
-          : `<div class="row-actions"><span style="color:var(--muted)">已结算</span>
-             <button class="btn btn-sm" data-act="correct" data-id="${s.id}">分段更正</button></div>`}
-      </td>
-    </tr>
-  `).join('');
+      <td>${actions}</td>
+    </tr>`;
+  }).join('');
 }
 
 // ---------- 渲染：分段更正记录 ----------
@@ -409,21 +475,33 @@ $('#frozenTable').addEventListener('click', (e) => {
   const slot = state.slots.find((s) => s.id === id);
   if (btn.dataset.act === 'finish') openFinishModal(slot);
   if (btn.dataset.act === 'correct') openCorrectModal(slot);
+  if (btn.dataset.act === 'pause') openPauseModal(slot);
+  if (btn.dataset.act === 'resume') openResumeModal(slot);
 });
 
+let finishIntervalModel = false;   // 结束补记是否针对“暂停/恢复模型”（只结最后区间）
 function openFinishModal(slot) {
   finishingSlotId = slot.id;
-  $('#fn_multi').checked = false;
-  $('#fn_singleBox').classList.remove('hidden');
-  $('#fn_multiBox').classList.add('hidden');
-  $('#fn_start').value = slot.actualStart || slot.plannedStart;
-  $('#fn_end').value = slot.actualEnd || slot.plannedEnd;
+  finishIntervalModel = !!(slot.intervals && slot.intervals.length);
+  const act = slot.activeInterval;
+  const fixedStart = finishIntervalModel && act ? act.start : (slot.actualStart || slot.plannedStart);
+  const fixedEnd = finishIntervalModel && act ? act.plannedEnd : (slot.actualEnd || slot.plannedEnd);
+  $('#fn_multi').checked = finishIntervalModel;
+  $('#fn_multi').disabled = finishIntervalModel;
+  $('#fn_multiRow').style.display = finishIntervalModel ? 'none' : '';
+  $('#fn_intervalHint').classList.toggle('hidden', !finishIntervalModel);
+  if (finishIntervalModel) {
+    const done = slot.intervals.filter((iv) => !iv.active).length;
+    $('#fn_intervalHint').textContent =
+      `该时段已暂停 ${done} 次：本次为最终结束，只需提交“最后一个展出区间”（${act.start} 起）的完整分段；已完成区间曝光已计入累计，暂停空档不计曝光。`;
+  }
+  $('#fn_singleBox').classList.toggle('hidden', finishIntervalModel);
+  $('#fn_multiBox').classList.toggle('hidden', !finishIntervalModel);
+  $('#fn_start').value = fixedStart;
+  $('#fn_start').disabled = finishIntervalModel;
+  $('#fn_end').value = fixedEnd;
   $('#fn_lux').value = slot.plannedLux;
-  fnSegments = [{
-    start: slot.actualStart || slot.plannedStart,
-    end: slot.actualEnd || slot.plannedEnd,
-    lux: slot.plannedLux,
-  }];
+  fnSegments = [{ start: fixedStart, end: fixedEnd, lux: slot.plannedLux }];
   renderFnSegments();
   $('#fn_error').classList.add('hidden');
   updateFinishPreview();
@@ -496,11 +574,20 @@ function blockedToastDetail(blocked) {
 }
 
 $('#fn_save').addEventListener('click', async () => {
-  const multi = $('#fn_multi').checked;
+  const multi = $('#fn_multi').checked || finishIntervalModel;
   const actualStart = $('#fn_start').value;
   const actualEnd = $('#fn_end').value;
   let payload;
-  if (multi) {
+  if (finishIntervalModel) {
+    // 暂停模型最终结算：只提交最后区间（actualStart 省略，服务端取恢复时间）
+    payload = {
+      version: state.version,
+      actualEnd,
+      segments: collectSegmentRows($('#fn_segments')).map((r) => ({
+        start: r.start, end: r.end, lux: r.lux === '' ? null : Number(r.lux),
+      })),
+    };
+  } else if (multi) {
     payload = {
       version: state.version,
       actualStart,
@@ -513,11 +600,14 @@ $('#fn_save').addEventListener('click', async () => {
     payload = { actualStart, actualEnd, actualLux: Number($('#fn_lux').value) };
   }
   try {
-    const next = await api(`/api/slots/${finishingSlotId}/${multi ? 'settle' : 'finish'}`, {
+    const next = await api(`/api/slots/${finishingSlotId}/${finishIntervalModel || multi ? 'settle' : 'finish'}`, {
       method: 'POST',
       body: payload,
     });
     $('#finishModal').classList.add('hidden');
+    $('#fn_multi').disabled = false;
+    $('#fn_start').disabled = false;
+    finishIntervalModel = false;
     applyNewState(next);
     if (next.blockedAfterFinish && next.blockedAfterFinish.length) {
       toast('warn', `已结算，实际曝光 ${fmt(next.justFinishedExposure)} lux·min 已替换预占。\n超量导致以下后续时段预算不足、不可开始：\n${blockedToastDetail(next.blockedAfterFinish)}\n请调整排期或更正分段后重新核算`);
@@ -527,6 +617,9 @@ $('#fn_save').addEventListener('click', async () => {
   } catch (err) {
     if (err.status === 409) {
       $('#finishModal').classList.add('hidden');
+      $('#fn_multi').disabled = false;
+      $('#fn_start').disabled = false;
+      finishIntervalModel = false;
       await handleMutationError(err);
       return;
     }
@@ -538,17 +631,38 @@ $('#fn_save').addEventListener('click', async () => {
 // ---------- 已结束时段：分段更正 ----------
 let correctingSlotId = null;
 let crSegments = [];
+let crIntervalGroups = [];   // 暂停模型：逐区间的分段草稿
+let crIsIntervalModel = false;
 
 function openCorrectModal(slot) {
   correctingSlotId = slot.id;
+  crIsIntervalModel = !!(slot.intervals && slot.intervals.length);
   $('#cr_title').textContent = `#${slot.seq} ${slot.hall} · 分段更正`;
-  $('#cr_span').textContent = `${slot.actualStart} ～ ${slot.actualEnd}（原实际曝光 ${slot.actualExposure} lux·min）`;
+  if (crIsIntervalModel) {
+    const first = slot.intervals[0];
+    const last = slot.intervals[slot.intervals.length - 1];
+    $('#cr_span').textContent =
+      `${first.start} ～ ${last.end}（${slot.intervals.length} 个展出区间，暂停空档不计；总曝光 ${slot.actualExposure} lux·min）`;
+    crIntervalGroups = slot.intervals.map((iv) => ({
+      start: iv.start, end: iv.end,
+      rows: iv.segments.length
+        ? iv.segments.map((g) => ({ start: g.start, end: g.end, lux: g.lux }))
+        : [{ start: iv.start, end: iv.end, lux: '' }],
+    }));
+    $('#cr_intervalBox').classList.remove('hidden');
+    $('#cr_singleBox').classList.add('hidden');
+    renderCrIntervals();
+  } else {
+    $('#cr_span').textContent = `${slot.actualStart} ～ ${slot.actualEnd}（原实际曝光 ${slot.actualExposure} lux·min）`;
+    crSegments = (slot.actualSegments && slot.actualSegments.length
+      ? slot.actualSegments
+      : [{ start: slot.actualStart, end: slot.actualEnd, lux: slot.actualLux }]
+    ).map((g) => ({ start: g.start, end: g.end, lux: g.lux }));
+    $('#cr_intervalBox').classList.add('hidden');
+    $('#cr_singleBox').classList.remove('hidden');
+    renderCrSegments();
+  }
   $('#cr_reason').value = '';
-  crSegments = (slot.actualSegments && slot.actualSegments.length
-    ? slot.actualSegments
-    : [{ start: slot.actualStart, end: slot.actualEnd, lux: slot.actualLux }]
-  ).map((g) => ({ start: g.start, end: g.end, lux: g.lux }));
-  renderCrSegments();
   $('#cr_error').classList.add('hidden');
   updateCorrectPreview();
   $('#correctModal').classList.remove('hidden');
@@ -556,7 +670,70 @@ function openCorrectModal(slot) {
 function renderCrSegments() {
   $('#cr_segments').innerHTML = segmentEditorRowsHtml(crSegments, 'cr');
 }
+// 暂停模型：逐区间渲染分段编辑器
+function renderCrIntervals() {
+  $('#cr_intervals').innerHTML = crIntervalGroups.map((grp, gi) => `
+    <div class="iv-block paused-iv" data-g="${gi}">
+      <div class="iv-head">
+        <span class="iv-tag">区间 ${gi + 1}</span>
+        <span class="mono-span">${esc(grp.start)} ～ ${esc(grp.end)}</span>
+      </div>
+      <div class="iv-segs">
+        ${grp.rows.map((r, ri) => `
+          <div class="seg-row" data-i="${ri}">
+            <span class="seg-no">${ri + 1}</span>
+            <input type="datetime-local" class="mono" data-f="start" value="${esc(r.start || '')}" />
+            <span class="seg-arrow">～</span>
+            <input type="datetime-local" class="mono" data-f="end" value="${esc(r.end || '')}" />
+            <input type="number" min="0" step="1" data-f="lux" value="${esc(r.lux ?? '')}" placeholder="lux" />
+            <button type="button" class="btn btn-sm btn-danger" data-act="rm-gseg">删</button>
+          </div>`).join('')}
+      </div>
+      <div style="margin:4px 0 8px">
+        <button type="button" class="btn btn-sm" data-act="add-gseg">＋ 区间 ${gi + 1} 添加分段</button>
+      </div>
+    </div>`).join('');
+}
+function syncCrGroupsFromDom() {
+  $('#cr_intervals').querySelectorAll('.iv-block').forEach((block) => {
+    const gi = Number(block.dataset.g);
+    crIntervalGroups[gi].rows = Array.from(block.querySelectorAll('.seg-row')).map((row) => ({
+      start: row.querySelector('[data-f="start"]').value,
+      end: row.querySelector('[data-f="end"]').value,
+      lux: row.querySelector('[data-f="lux"]').value,
+    }));
+  });
+}
+$('#cr_intervals').addEventListener('click', (e) => {
+  const block = e.target.closest('.iv-block');
+  if (!block) return;
+  syncCrGroupsFromDom();
+  const gi = Number(block.dataset.g);
+  if (e.target.closest('[data-act="add-gseg"]')) {
+    const prev = crIntervalGroups[gi].rows.slice(-1)[0] || {};
+    crIntervalGroups[gi].rows.push({ start: prev.end || crIntervalGroups[gi].start, end: '', lux: '' });
+    renderCrIntervals();
+    updateCorrectPreview();
+  }
+  if (e.target.closest('[data-act="rm-gseg"]')) {
+    const ri = Number(e.target.closest('.seg-row').dataset.i);
+    crIntervalGroups[gi].rows.splice(ri, 1);
+    renderCrIntervals();
+    updateCorrectPreview();
+  }
+});
+$('#cr_intervals').addEventListener('input', () => { syncCrGroupsFromDom(); updateCorrectPreview(); });
 function updateCorrectPreview() {
+  if (crIsIntervalModel) {
+    let total = 0;
+    for (const grp of crIntervalGroups) {
+      const v = segmentsExposure(grp.rows);
+      if (v === null) { $('#cr_preview').textContent = '–'; return; }
+      total += v;
+    }
+    $('#cr_preview').textContent = fmt(Math.round(total * 1000) / 1000);
+    return;
+  }
   const v = segmentsExposure(collectSegmentRows($('#cr_segments')));
   $('#cr_preview').textContent = v === null ? '–' : fmt(v);
 }
@@ -577,13 +754,27 @@ $('#cr_segments').addEventListener('click', (e) => {
 $('#cr_segments').addEventListener('input', updateCorrectPreview);
 
 $('#cr_save').addEventListener('click', async () => {
-  const payload = {
-    version: state.version,
-    reason: $('#cr_reason').value,
-    segments: collectSegmentRows($('#cr_segments')).map((r) => ({
-      start: r.start, end: r.end, lux: r.lux === '' ? null : Number(r.lux),
-    })),
-  };
+  let payload;
+  if (crIsIntervalModel) {
+    syncCrGroupsFromDom();
+    payload = {
+      version: state.version,
+      reason: $('#cr_reason').value,
+      intervalSegments: crIntervalGroups.map((grp) => ({
+        segments: grp.rows.map((r) => ({
+          start: r.start, end: r.end, lux: r.lux === '' ? null : Number(r.lux),
+        })),
+      })),
+    };
+  } else {
+    payload = {
+      version: state.version,
+      reason: $('#cr_reason').value,
+      segments: collectSegmentRows($('#cr_segments')).map((r) => ({
+        start: r.start, end: r.end, lux: r.lux === '' ? null : Number(r.lux),
+      })),
+    };
+  }
   try {
     const next = await api(`/api/slots/${correctingSlotId}/correct`, { method: 'POST', body: payload });
     $('#correctModal').classList.add('hidden');
@@ -608,9 +799,137 @@ function formatSegmentError(err) {
   const p = err.payload || {};
   const lines = [];
   if (p.errors && p.errors.length) p.errors.forEach((x) => lines.push(`• ${typeof x === 'string' ? x : x.message}`));
-  else if (err.message) lines.push(err.message);
+  if (p.conflicts && p.conflicts.length) {
+    p.conflicts.forEach((c) => lines.push(`• 与作品「${c.artworkName}」的时段重叠：${c.other.label}`));
+  }
+  if (!lines.length && err.message) lines.push(err.message);
   return lines.join('\n') || '提交失败';
 }
+
+// ---------- 暂停（临时闭馆） ----------
+let pausingSlotId = null;
+let paSegments = [];
+
+function openPauseModal(slot) {
+  pausingSlotId = slot.id;
+  const act = slot.activeInterval;
+  const firstPause = !act && (!slot.intervals || !slot.intervals.length);
+  $('#pa_title').textContent = `#${slot.seq} ${slot.hall} · 暂停（临时闭馆）`;
+  // 再次暂停：起点固定为恢复时间，不可改；首次可录实际开始
+  const fixedStart = act ? act.start : (slot.actualStart || slot.plannedStart);
+  $('#pa_start').value = fixedStart;
+  $('#pa_start').disabled = !firstPause;
+  $('#pa_startLabel').textContent = firstPause ? '本段实际开始（首次可录实际开始）' : '本段起点（恢复时间，不可改）';
+  $('#pa_end').value = act ? act.plannedEnd : slot.plannedEnd;
+  paSegments = [{ start: fixedStart, end: act ? act.plannedEnd : slot.plannedEnd, lux: slot.plannedLux }];
+  renderPaSegments();
+  $('#pa_error').classList.add('hidden');
+  updatePaPreview();
+  $('#pauseModal').classList.remove('hidden');
+}
+function renderPaSegments() {
+  $('#pa_segments').innerHTML = segmentEditorRowsHtml(paSegments, 'pa');
+}
+function updatePaPreview() {
+  const v = segmentsExposure(collectSegmentRows($('#pa_segments')));
+  $('#pa_preview').textContent = v === null ? '–' : fmt(v);
+}
+$('#pa_addSeg').addEventListener('click', () => {
+  paSegments = collectSegmentRows($('#pa_segments'));
+  const prev = paSegments[paSegments.length - 1] || {};
+  paSegments.push({ start: prev.end || '', end: $('#pa_end').value || '', lux: '' });
+  renderPaSegments();
+  updatePaPreview();
+});
+$('#pa_segments').addEventListener('click', (e) => {
+  if (!e.target.closest('button[data-act="rm"]')) return;
+  paSegments = collectSegmentRows($('#pa_segments'));
+  paSegments.splice(Number(e.target.closest('.seg-row').dataset.i), 1);
+  renderPaSegments();
+  updatePaPreview();
+});
+$('#pa_segments').addEventListener('input', updatePaPreview);
+$('#pa_start').addEventListener('change', () => {
+  if ($('#pa_start').disabled) return;
+  const rows = collectSegmentRows($('#pa_segments'));
+  if (rows[0]) { rows[0].start = $('#pa_start').value; paSegments = rows; renderPaSegments(); updatePaPreview(); }
+});
+$('#pa_end').addEventListener('change', () => {
+  const rows = collectSegmentRows($('#pa_segments'));
+  if (rows.length) { rows[rows.length - 1].end = $('#pa_end').value; paSegments = rows; renderPaSegments(); updatePaPreview(); }
+});
+$('#pa_save').addEventListener('click', async () => {
+  const slot = state.slots.find((s) => s.id === pausingSlotId);
+  const payload = {
+    version: state.version,
+    pauseEnd: $('#pa_end').value,
+    segments: collectSegmentRows($('#pa_segments')).map((r) => ({
+      start: r.start, end: r.end, lux: r.lux === '' ? null : Number(r.lux),
+    })),
+  };
+  if (!slot.activeInterval && (!slot.intervals || !slot.intervals.length)) {
+    payload.actualStart = $('#pa_start').value;
+  }
+  try {
+    const next = await api(`/api/slots/${pausingSlotId}/pause`, { method: 'POST', body: payload });
+    $('#pauseModal').classList.add('hidden');
+    applyNewState(next);
+    toast('success', `已暂停：本区间曝光 ${fmt(next.justPausedInterval.exposure)} lux·min 计入累计，未展预占已释放；恢复时需提交恢复时间与新预计结束`);
+  } catch (err) {
+    if (err.status === 409) {
+      $('#pauseModal').classList.add('hidden');
+      return handleMutationError(err);
+    }
+    $('#pa_error').textContent = formatSegmentError(err);
+    $('#pa_error').classList.remove('hidden');
+  }
+});
+
+// ---------- 恢复（重新开馆） ----------
+let resumingSlotId = null;
+function openResumeModal(slot) {
+  resumingSlotId = slot.id;
+  const lastI = (slot.intervals || []).filter((iv) => !iv.active).slice(-1)[0];
+  $('#rs_title').textContent = `#${slot.seq} ${slot.hall} · 恢复展出`;
+  $('#rs_at').value = lastI ? lastI.end : '';
+  $('#rs_end').value = slot.plannedEnd;
+  $('#rs_lux').textContent = `${slot.plannedLux} lux`;
+  $('#rs_error').classList.add('hidden');
+  updateRsPreview();
+  $('#resumeModal').classList.remove('hidden');
+}
+function updateRsPreview() {
+  const slot = state.slots.find((s) => s.id === resumingSlotId);
+  const m = minutes($('#rs_at').value, $('#rs_end').value);
+  if (!slot || m === null || m <= 0) { $('#rs_preview').textContent = '–'; return; }
+  $('#rs_preview').textContent = fmt(Math.round(m * slot.plannedLux));
+}
+$('#rs_at').addEventListener('input', updateRsPreview);
+$('#rs_end').addEventListener('input', updateRsPreview);
+$('#rs_save').addEventListener('click', async () => {
+  const payload = {
+    version: state.version,
+    resumeAt: $('#rs_at').value,
+    newEstimatedEnd: $('#rs_end').value,
+  };
+  try {
+    const next = await api(`/api/slots/${resumingSlotId}/resume`, { method: 'POST', body: payload });
+    $('#resumeModal').classList.add('hidden');
+    applyNewState(next);
+    if (next.blockedAfterFinish && next.blockedAfterFinish.length) {
+      toast('warn', `已恢复：按新时长预占 ${fmt(next.reservedExposure)} lux·min。\n注意以下后续时段预算不足：\n${blockedToastDetail(next.blockedAfterFinish)}`);
+    } else {
+      toast('success', `已恢复展出（${next.resumeAt} → ${next.newEstimatedEnd}），新预占 ${fmt(next.reservedExposure)} lux·min`);
+    }
+  } catch (err) {
+    if (err.status === 409) {
+      $('#resumeModal').classList.add('hidden');
+      return handleMutationError(err);
+    }
+    $('#rs_error').textContent = formatSegmentError(err);
+    $('#rs_error').classList.remove('hidden');
+  }
+});
 
 // ---------- 作品弹窗 ----------
 function openArtworkModal(a) {

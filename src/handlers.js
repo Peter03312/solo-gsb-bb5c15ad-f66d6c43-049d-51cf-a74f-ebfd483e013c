@@ -197,33 +197,26 @@ function replaceSchedule(db, body) {
     }
   }
 
-  // 新时段与冻结时段（进行中，按冻结的原计划区间；已结束按实际区间）之间
+  // 新时段与冻结时段（进行中/已暂停按各展出区间与当前预占区间；已结束按实际/展出区间）之间
   const frozen = B.loadSlots(db).filter((s) => s.status !== 'scheduled');
+  const frozenIntMap = B.loadIntervals(db);
   for (const p of proposed) {
     for (const f of frozen) {
       const intersects = p.artworkIds.some((aid) => f.artworkIds.includes(aid));
       if (!intersects) continue;
-      let fs, fe;
-      if (f.status === 'finished') {
-        const a = B.parseDateTime(f.actual_start);
-        const b = B.parseDateTime(f.actual_end);
-        fs = a.minutes; fe = b.minutes;
-      } else {
-        const a = B.parseDateTime(f.planned_start);
-        const b = B.parseDateTime(f.planned_end);
-        fs = a.minutes; fe = b.minutes;
-      }
-      if (p.startMin < fe && fs < p.endMin) {
-        const fView = {
-          cid: `saved#${f.id}`, hall: f.hall,
-          start: f.status === 'finished' ? f.actual_start : f.planned_start,
-          end: f.status === 'finished' ? f.actual_end : f.planned_end,
-          lux: f.status === 'finished' ? f.actual_lux : f.planned_lux,
-          artworkIds: f.artworkIds,
-          label: `${f.hall} ${f.status === 'finished' ? f.actual_start : f.planned_start} ~ ${f.status === 'finished' ? f.actual_end : f.planned_end}（${f.status === 'finished' ? '已结束' : '进行中·冻结'}）`,
-        };
-        for (const aid of p.artworkIds) {
-          if (f.artworkIds.includes(aid)) addOverlap(aid, p, fView, 'new-frozen');
+      const spans = B.slotOccupiedSpans(f, frozenIntMap.get(f.id) || []);
+      for (const sp of spans) {
+        if (p.startMin < sp.endMin && sp.startMin < p.endMin) {
+          const fView = {
+            cid: `saved#${f.id}`, hall: f.hall,
+            start: sp.start, end: sp.end,
+            lux: sp.kind === 'reserve' ? f.planned_lux : null,
+            artworkIds: f.artworkIds,
+            label: `${f.hall} ${sp.start} ~ ${sp.end}（${B.statusLabel(f.status)}）`,
+          };
+          for (const aid of p.artworkIds) {
+            if (f.artworkIds.includes(aid)) addOverlap(aid, p, fView, 'new-frozen');
+          }
         }
       }
     }
@@ -235,13 +228,15 @@ function replaceSchedule(db, body) {
     });
   }
 
-  // 2) 预算：既有 + 进行中预占 + 本批未开始预占 <= 上限
+  // 2) 预算：既有 + 已完成区间已用 + 进行中当前预占 + 本批未开始预占 <= 上限
   const used = new Map(artworks.map((a) => [a.id, a.existing_amount]));
   for (const f of frozen) {
+    const intervals = frozenIntMap.get(f.id) || [];
+    const completed = B.slotCompletedExposure(f, intervals);
+    const reserved = f.status === 'running' ? B.slotReservedExposure(f, intervals) : 0;
+    const charge = B.round3(completed + reserved);
     for (const aid of f.artworkIds) {
-      if (!used.has(aid)) continue;
-      if (f.status === 'finished') used.set(aid, used.get(aid) + (f.actual_exposure || 0));
-      else used.set(aid, used.get(aid) + (B.plannedExposure(f) || 0));
+      if (used.has(aid)) used.set(aid, used.get(aid) + charge);
     }
   }
 
@@ -342,6 +337,11 @@ function finishSlot(db, id, body) {
     if (slot.status !== 'running') {
       throw new HttpError(422, 'NOT_RUNNING', `时段 #${id} 当前状态为 ${slot.status}，仅进行中时段可以结束补记`);
     }
+    // 暂停/恢复模型时段须按最后展出区间多段结算（settle），单一照度链路不处理
+    if ((B.loadIntervals(db).get(id) || []).length > 0) {
+      throw new HttpError(422, 'SEGMENTS_REQUIRED',
+        '该时段使用过暂停/恢复，请改用多段结算接口提交最后展出区间的完整照度分段');
+    }
     // 实际曝光替换该时段预占
     db.prepare(`
       UPDATE slots SET status = 'finished',
@@ -412,14 +412,80 @@ function blockedAfterMutation(state) {
 function settleSlot(db, id, body) {
   const tx = db.transaction(() => {
     requireVersion(db, body);
-    const span = parseActualSpan(body);
-    const segments = requireSegments(body, span);
-    const exposure = B.sumSegmentExposure(segments);
 
     const slot = db.prepare('SELECT * FROM slots WHERE id = ?').get(id);
     if (!slot) throw new HttpError(404, 'NOT_FOUND', `时段 #${id} 不存在`);
     if (slot.status !== 'running') {
       throw new HttpError(422, 'NOT_RUNNING', `时段 #${id} 当前状态为 ${slot.status}，仅进行中时段可以多段结算`);
+    }
+
+    const intervals = B.loadIntervals(db).get(id) || [];
+    const active = B.activeInterval(intervals);
+    let span;
+    if (active) {
+      // 暂停/恢复模型：本次提交只覆盖“最后一个展出区间”，起点必须是恢复时间
+      span = {
+        start: active.start,
+        end: null,
+        startMin: B.parseDateTime(active.start).minutes,
+      };
+      const ae = B.parseDateTime(body && body.actualEnd, '实际结束时间');
+      if (ae.error) throw new HttpError(422, 'VALIDATION', ae.error);
+      if (body && body.actualStart != null && body.actualStart.trim() !== active.start) {
+        throw new HttpError(422, 'VALIDATION',
+          `最后展出区间已于 ${active.start} 恢复，实际开始必须为该恢复时间`);
+      }
+      if (ae.minutes <= span.startMin) {
+        throw new HttpError(422, 'VALIDATION', '时序无效：实际结束必须晚于恢复时间');
+      }
+      span.end = body.actualEnd.trim();
+      span.endMin = ae.minutes;
+
+      const done = intervals.filter((iv) => !iv.active);
+      if (done.length && ae.minutes <= B.parseDateTime(done[done.length - 1].end).minutes) {
+        throw new HttpError(422, 'VALIDATION', '时序无效：实际结束必须晚于上次暂停终点');
+      }
+    } else {
+      span = parseActualSpan(body);
+    }
+    const segments = requireSegments(body, span);
+    const exposure = B.sumSegmentExposure(segments);
+
+    // 同作品其他时段不得与最后展出区间重叠
+    const artworkIds = B.loadSlots(db).find((x) => x.id === id).artworkIds;
+    const artName = new Map(B.loadArtworks(db).map((a) => [a.id, a.name]));
+    const overlaps = B.findArtworkOverlaps(db, artworkIds, id, span.startMin, span.endMin, artName);
+    if (overlaps.length) throw overlapError(overlaps);
+
+    if (active) {
+      const prevCompleted = B.intervalsCompleted(intervals);
+      const cumulative = B.round3(prevCompleted + exposure);
+      // 完结当前区间
+      db.prepare(`
+        UPDATE slot_intervals SET int_end = ?, planned_end = ?, exposure = ?, is_active = 0
+        WHERE id = ?
+      `).run(span.end, active.plannedEnd, exposure, active.id);
+      replaceIntervalSegments(db, active.id, segments);
+      // 时段最终结束：actual 记录首段起点~最终终点（跨空档仅用于展示），累计为各区间之和
+      const firstStart = intervals.slice().sort((a, b) => a.index - b.index)[0].start;
+      db.prepare(`
+        UPDATE slots SET status = 'finished',
+          actual_start = ?, actual_end = ?, actual_lux = NULL, actual_exposure = ?
+        WHERE id = ?
+      `).run(firstStart, span.end, cumulative, id);
+
+      B.recomputeBlocked(db);
+      B.bumpVersion(db);
+      const state = B.summarize(db);
+      const settled = state.slots.find((s) => s.id === id) || null;
+      return {
+        ...state,
+        justFinishedExposure: exposure,
+        justFinishedSegments: segments,
+        cumulativeExposure: cumulative,
+        justFinishedSlot: settled,
+        blockedAfterFinish: blockedAfterMutation(state),
+      };
     }
 
     db.prepare(`
@@ -465,18 +531,70 @@ function correctSlot(db, id, body) {
     }
 
     // 沿用原实际起止（更正只改分段照度，不允许改区间）；完整分段必须覆盖原区间
-    const span = {
-      start: slot.actual_start,
-      end: slot.actual_end,
-      startMin: B.parseDateTime(slot.actual_start).minutes,
-      endMin: B.parseDateTime(slot.actual_end).minutes,
-    };
-    const segments = requireSegments(body, span);
-    const newExposure = B.sumSegmentExposure(segments);
+    const intervals = B.loadIntervals(db).get(id) || [];
+    let span;
+    let intervalGroups = null;   // 暂停模型：逐区间的更正分段
+    let segmentsLegacy = null;   // 旧模型：覆盖整个实际区间的分段
+    let newExposure;
+    if (intervals.length) {
+      // 暂停/恢复模型：segments 按区间分组提交，每组必须完整覆盖该展出区间（空档不补）
+      const groups = body && Array.isArray(body.intervalSegments) ? body.intervalSegments : null;
+      if (!groups || groups.length !== intervals.length) {
+        throw new HttpError(422, 'SEGMENTS_INVALID',
+          `该时段含 ${intervals.length} 个展出区间，请以 intervalSegments 数组逐区间提交完整分段`, {
+          errors: [`需要 ${intervals.length} 组分段，收到 ${groups ? groups.length : 0} 组`],
+        });
+      }
+      intervalGroups = [];
+      let total = 0;
+      intervals.forEach((iv, i) => {
+        const ivSpan = {
+          start: iv.start, end: iv.end,
+          startMin: B.parseDateTime(iv.start).minutes,
+          endMin: B.parseDateTime(iv.end).minutes,
+        };
+        const v = B.validateSegments(groups[i] && groups[i].segments,
+          { minutes: ivSpan.startMin, text: ivSpan.start },
+          { minutes: ivSpan.endMin, text: ivSpan.end });
+        if (v.errors) {
+          throw new HttpError(422, 'SEGMENTS_INVALID',
+            `整批已拒绝：第 ${i + 1} 个展出区间照度分段不合法`, {
+            errors: v.errors.map((m) => `[区间 ${i + 1}] ${m}`),
+          });
+        }
+        intervalGroups.push(v.segments);
+        total += B.sumSegmentExposure(v.segments);
+      });
+      newExposure = B.round3(total);
+      span = {
+        start: intervals[0].start,
+        end: intervals[intervals.length - 1].end,
+      };
+    } else {
+      span = {
+        start: slot.actual_start,
+        end: slot.actual_end,
+        startMin: B.parseDateTime(slot.actual_start).minutes,
+        endMin: B.parseDateTime(slot.actual_end).minutes,
+      };
+      segmentsLegacy = requireSegments(body, span);
+      newExposure = B.sumSegmentExposure(segmentsLegacy);
+    }
     const beforeExposure = B.round3(slot.actual_exposure || 0);
 
     db.prepare('UPDATE slots SET actual_exposure = ? WHERE id = ?').run(newExposure, id);
-    replaceSegments(db, id, segments);
+    if (intervalGroups) {
+      intervals.forEach((iv, i) => replaceIntervalSegments(db, iv.id, intervalGroups[i]));
+      // 同步区间曝光留档
+      const updIv = db.prepare('UPDATE slot_intervals SET exposure = ? WHERE id = ?');
+      intervals.forEach((iv, i) => updIv.run(B.sumSegmentExposure(intervalGroups[i]), iv.id));
+    } else {
+      replaceSegments(db, id, segmentsLegacy);
+    }
+    // 更正快照：暂停模型展平为段序列（标注区间号）；旧模型即原分段
+    const snapshotSegments = intervalGroups
+      ? intervalGroups.flatMap((list, ii) => list.map((g) => ({ ...g, intervalIndex: ii + 1 })))
+      : segmentsLegacy;
     db.prepare(`
       INSERT INTO slot_corrections
         (slot_id, reason, before_start, before_end, before_exposure,
@@ -495,7 +613,7 @@ function correctSlot(db, id, body) {
         (correction_id, seg_index, seg_start, seg_end, lux, exposure)
       VALUES (?, ?, ?, ?, ?, ?)
     `);
-    segments.forEach((s, i) => insCorrSeg.run(correctionId, i + 1, s.start, s.end, s.lux, s.exposure));
+    snapshotSegments.forEach((s, i) => insCorrSeg.run(correctionId, i + 1, s.start, s.end, s.lux, s.exposure));
 
     B.recomputeBlocked(db);
     B.bumpVersion(db);
@@ -515,8 +633,202 @@ function correctSlot(db, id, body) {
   return tx.immediate();
 }
 
+// ---------- 巡展暂停 / 恢复（临时闭馆） ----------
+// 区间模型：每次暂停提交“当前展出区间 [实际开始/恢复时间 → 暂停时间] + 完整衔接分段”，
+// 已完成区间计入已用、释放未展预占；恢复提交“恢复时间 + 新预计结束”，从恢复时间起按
+// 计划照度预占新的一段。允许多次暂停；最终结束走 settle（多段），分段覆盖最后一个区间。
+
+function overlapError(conflicts) {
+  return new HttpError(422, 'OVERLAP_CONFLICT', '整次已拒绝：与同作品其他时段占用区间重叠', {
+    conflicts: conflicts.map((c) => ({
+      artworkId: c.artworkId,
+      artworkName: c.artworkName,
+      kind: c.kind,
+      other: c.other,
+    })),
+  });
+}
+
+// 在事务内替换某区间的分段
+function replaceIntervalSegments(db, intervalId, segments) {
+  db.prepare('DELETE FROM slot_interval_segments WHERE interval_id = ?').run(intervalId);
+  const ins = db.prepare(`
+    INSERT INTO slot_interval_segments (interval_id, seg_index, seg_start, seg_end, lux, exposure)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `);
+  segments.forEach((s, i) => ins.run(intervalId, i + 1, s.start, s.end, s.lux, s.exposure));
+}
+
+// 暂停：{version, actualStart?, pauseEnd, segments}
+// 首次暂停 actualStart 可录实际开始（缺省取冻结计划开始）；再次暂停必须从恢复时间开始。
+function pauseSlot(db, id, body) {
+  const tx = db.transaction(() => {
+    requireVersion(db, body);
+
+    const slot = db.prepare('SELECT * FROM slots WHERE id = ?').get(id);
+    if (!slot) throw new HttpError(404, 'NOT_FOUND', `时段 #${id} 不存在`);
+    if (slot.status !== 'running') {
+      throw new HttpError(422, 'NOT_RUNNING', `时段 #${id} 当前状态为 ${slot.status}，仅进行中时段可以暂停`);
+    }
+
+    const intervals = B.loadIntervals(db).get(id) || [];
+    const active = B.activeInterval(intervals);
+
+    // 本段起点：已有进行中区间则为其恢复时间（不可改）；首次暂停允许录实际开始
+    let startStr, startMin;
+    if (active) {
+      if (body && body.actualStart != null && body.actualStart.trim() !== active.start) {
+        throw new HttpError(422, 'VALIDATION',
+          `本段已于 ${active.start} 恢复，暂停时区间起点必须为该恢复时间`);
+      }
+      startStr = active.start;
+      startMin = B.parseDateTime(startStr).minutes;
+    } else {
+      startStr = body && body.actualStart != null && String(body.actualStart).trim() !== ''
+        ? String(body.actualStart).trim() : slot.planned_start;
+      const ps = B.parseDateTime(startStr, '实际开始时间');
+      if (ps.error) throw new HttpError(422, 'VALIDATION', ps.error);
+      startMin = ps.minutes;
+    }
+
+    const pe = B.parseDateTime(body && body.pauseEnd, '暂停时间');
+    if (pe.error) throw new HttpError(422, 'VALIDATION', pe.error);
+    if (pe.minutes <= startMin) {
+      throw new HttpError(422, 'VALIDATION', '时序无效：暂停时间必须晚于本段起点');
+    }
+    const endStr = body.pauseEnd.trim();
+
+    // 与既往已完成区间递增、互不重叠：暂停时间须晚于上一区间终点（起点为恢复时间，本身已更晚）
+    const done = intervals.filter((iv) => !iv.active);
+    if (done.length) {
+      const prev = done[done.length - 1];
+      const prevEnd = B.parseDateTime(prev.end).minutes;
+      if (pe.minutes <= prevEnd) {
+        throw new HttpError(422, 'VALIDATION',
+          `时序无效：暂停时间 ${endStr} 必须晚于上次暂停终点 ${prev.end}`);
+      }
+    }
+
+    // 分段必须首尾衔接、无重叠、完整覆盖 [本段起点, 暂停时间]
+    const span = { start: startStr, end: endStr, startMin, endMin: pe.minutes };
+    const segments = requireSegments(body, span);
+    const exposure = B.sumSegmentExposure(segments);
+
+    // 同作品其他时段（含未开始计划区间）不得与本展出区间重叠
+    const artworkIds = B.loadSlots(db).find((x) => x.id === id).artworkIds;
+    const artName = new Map(B.loadArtworks(db).map((a) => [a.id, a.name]));
+    const overlaps = B.findArtworkOverlaps(db, artworkIds, id, startMin, pe.minutes, artName);
+    if (overlaps.length) throw overlapError(overlaps);
+
+    const cumulative = B.round3(B.intervalsCompleted(intervals) + exposure);
+
+    if (active) {
+      // 再次暂停：完结当前区间，保留其预计结束留档
+      db.prepare(`
+        UPDATE slot_intervals SET int_end = ?, planned_end = ?, exposure = ?, is_active = 0
+        WHERE id = ?
+      `).run(endStr, active.plannedEnd, exposure, active.id);
+      replaceIntervalSegments(db, active.id, segments);
+    } else {
+      // 首次暂停：插入第 1 个已完成区间（planned_end 留档取暂停时间）
+      const info = db.prepare(`
+        INSERT INTO slot_intervals (slot_id, int_index, int_start, int_end, planned_end, exposure, is_active)
+        VALUES (?, ?, ?, ?, ?, ?, 0)
+      `).run(id, 1, startStr, endStr, endStr, exposure);
+      replaceIntervalSegments(db, info.lastInsertRowid, segments);
+    }
+
+    // 暂停：空档释放预占；累计曝光写入 actual_exposure（读取层据此展示累计）
+    db.prepare(`
+      UPDATE slots SET status = 'paused', actual_start = ?, actual_end = ?,
+        actual_lux = NULL, actual_exposure = ?
+      WHERE id = ?
+    `).run(startStr, endStr, cumulative, id);
+
+    B.recomputeBlocked(db);
+    B.bumpVersion(db);
+    const state = B.summarize(db);
+    const dto = state.slots.find((s) => s.id === id) || null;
+    return {
+      ...state,
+      paused: dto,
+      justPausedInterval: { start: startStr, end: endStr, exposure, segments },
+      cumulativeExposure: cumulative,
+      releasedReservation: true,
+      blockedAfterFinish: blockedAfterMutation(state),
+    };
+  });
+  return tx.immediate();
+}
+
+// 恢复：{version, resumeAt, newEstimatedEnd}
+// 恢复时间晚于上次暂停终点；新预计结束晚于恢复时间；按新时长 × 计划照度重新预占。
+function resumeSlot(db, id, body) {
+  const tx = db.transaction(() => {
+    requireVersion(db, body);
+
+    const slot = db.prepare('SELECT * FROM slots WHERE id = ?').get(id);
+    if (!slot) throw new HttpError(404, 'NOT_FOUND', `时段 #${id} 不存在`);
+    if (slot.status !== 'paused') {
+      throw new HttpError(422, 'NOT_PAUSED', `时段 #${id} 当前状态为 ${slot.status}，仅已暂停时段可以恢复`);
+    }
+
+    const intervals = B.loadIntervals(db).get(id) || [];
+    const done = intervals.filter((iv) => !iv.active);
+    const last = done[done.length - 1];
+    if (!last) throw new HttpError(422, 'VALIDATION', '暂停区间数据缺失，无法恢复');
+
+    const rs = B.parseDateTime(body && body.resumeAt, '恢复时间');
+    if (rs.error) throw new HttpError(422, 'VALIDATION', rs.error);
+    const resumeStr = body.resumeAt.trim();
+    const lastEndMin = B.parseDateTime(last.end).minutes;
+    if (rs.minutes <= lastEndMin) {
+      throw new HttpError(422, 'VALIDATION',
+        `时序无效：恢复时间 ${resumeStr} 必须晚于上次暂停终点 ${last.end}`);
+    }
+
+    const ne = B.parseDateTime(body && body.newEstimatedEnd, '新预计结束时间');
+    if (ne.error) throw new HttpError(422, 'VALIDATION', ne.error);
+    if (ne.minutes <= rs.minutes) {
+      throw new HttpError(422, 'VALIDATION', '时序无效：新预计结束时间必须晚于恢复时间');
+    }
+    const newEndStr = body.newEstimatedEnd.trim();
+
+    // 同作品其他时段不得与新预占区间 [恢复时间, 新预计结束) 重叠
+    const links = B.loadSlots(db).find((x) => x.id === id).artworkIds;
+    const artName = new Map(B.loadArtworks(db).map((a) => [a.id, a.name]));
+    const overlaps = B.findArtworkOverlaps(db, links, id, rs.minutes, ne.minutes, artName);
+    if (overlaps.length) throw overlapError(overlaps);
+
+    const nextIndex = intervals.length + 1;
+    db.prepare(`
+      INSERT INTO slot_intervals (slot_id, int_index, int_start, int_end, planned_end, exposure, is_active)
+      VALUES (?, ?, ?, NULL, ?, NULL, 1)
+    `).run(id, nextIndex, resumeStr, newEndStr);
+
+    // 恢复：status=running，actual_end 清空（展出重新进行中），累计曝光保留
+    db.prepare("UPDATE slots SET status = 'running', actual_end = NULL WHERE id = ?").run(id);
+
+    B.recomputeBlocked(db);
+    B.bumpVersion(db);
+    const state = B.summarize(db);
+    const dto = state.slots.find((s) => s.id === id) || null;
+    const reservedMins = ne.minutes - rs.minutes;
+    return {
+      ...state,
+      resumed: dto,
+      resumeAt: resumeStr,
+      newEstimatedEnd: newEndStr,
+      reservedExposure: B.round3(reservedMins * slot.planned_lux),
+      blockedAfterFinish: blockedAfterMutation(state),
+    };
+  });
+  return tx.immediate();
+}
+
 module.exports = {
   HttpError, readBody, parseId,
   createArtwork, updateArtwork, deleteArtwork,
   replaceSchedule, startSlot, finishSlot, settleSlot, correctSlot,
+  pauseSlot, resumeSlot,
 };
